@@ -18,18 +18,17 @@ enum SceneNodeType {
 };
 
 struct SceneNode {
-	SceneNode() {
-		position = glm::vec3(0, 0, 0);
-		rotation = glm::vec3(0, 0, 0);
-		scale = glm::vec3(1, 1, 1);
-
+    SceneNode() {
+        position = glm::vec3(0, 0, 0);
+        rotation = glm::vec3(0, 0, 0);
+        scale = glm::vec3(1, 1, 1);
         referencePoint = glm::vec3(0, 0, 0);
         vertexArrayObjectID = -1;
         VAOIndexCount = 0;
-
         nodeType = GEOMETRY;
-
-	}
+        textureID = 0;
+        hasTexture = false;
+    }
 
 	// A list of all children that belong to this node.
 	// For instance, in case of the scene graph of a human body shown in the assignment text, the "Upper Torso" node would contain the "Left Arm", "Right Arm", "Head" and "Lower Torso" nodes in its list of children.
@@ -53,6 +52,9 @@ struct SceneNode {
 	// The ID of the VAO containing the "appearance" of this SceneNode.
 	int vertexArrayObjectID;
 	unsigned int VAOIndexCount;
+
+    unsigned int textureID;
+    bool hasTexture;
 
 	// Node type is used to determine how to handle the contents of a node
 	SceneNodeType nodeType;

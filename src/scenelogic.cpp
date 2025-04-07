@@ -17,7 +17,8 @@
 #include "sceneGraph.hpp"
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtx/transform.hpp>
-
+#include "utilities/modelLoader.hpp"
+#include "utilities/textureLoader.hpp"
 #include "utilities/imageLoader.hpp"
 #include "utilities/glfont.h"
 
@@ -29,32 +30,23 @@ enum KeyFrameAction
 
 #include <timestamps.h>
 
-double padPositionX = 0.5;
-double padPositionZ = 0.5;
-
 unsigned int currentKeyFrame = 0;
 unsigned int previousKeyFrame = 0;
 
 SceneNode *rootNode;
-SceneNode *boxNode;
-SceneNode *padNode;
 SceneNode *lightNode;
 
-static const int numLights = 3;
+static const int numLights = 1;
 int lightIndex = 0;
 
 LightSource lightSources[numLights];
 
 float cameraYaw = 0.0f;    // Horizontal angle (longitude)
 float cameraPitch = 0.0f;  // Vertical angle (latitude)
-const float cameraRadius = 100.0f; // Distance from the center of the scene
+const float cameraRadius = 200.0f; // Distance from the center of the scene
 
 // These are heap allocated, because they should not be initialised at the start of the program
 Gloom::Shader *shader;
-
-const glm::vec3 boxDimensions(180, 90, 90);
-const glm::vec3 padDimensions(30, 3, 40);
-
 
 CommandLineOptions options;
 
@@ -110,35 +102,37 @@ void initScene(GLFWwindow *window, CommandLineOptions sceneOptions)
     shader->makeBasicShader("../res/shaders/simple.vert", "../res/shaders/simple.frag");
     shader->activate();
 
-    // Create meshes
-    Mesh pad = cube(padDimensions, glm::vec2(30, 40), true);
-    Mesh box = cube(boxDimensions, glm::vec2(90), true, true);
-
-    // Fill buffers
-    unsigned int boxVAO = generateBuffer(box);
-    unsigned int padVAO = generateBuffer(pad);
-
     // Construct scene
     rootNode = createSceneNode();
-    boxNode = createSceneNode();
-    padNode = createSceneNode();
 
     lightNode = createSceneNode();
     lightNode->nodeType = POINT_LIGHT;
-    lightNode->position = glm::vec3(0.0f, 0.0f, -60.0f);
+    lightNode->position = glm::vec3(0.0f, 100.0f, 50.0f);
     lightNode->lightColor = glm::vec3(1.0, 1.0, 1.0);
 
-
-    rootNode->children.push_back(boxNode);
-    rootNode->children.push_back(padNode);
     rootNode->children.push_back(lightNode);
 
+    
+    std::string diffuseTexName;
+    Mesh sundialMesh = loadOBJModel("../res/models/sundial.obj", "../res/models/", diffuseTexName);
+    unsigned int sundialVAO = generateBuffer(sundialMesh);
+    SceneNode *sundialNode = createSceneNode();
+    sundialNode->vertexArrayObjectID = sundialVAO;
+    sundialNode->VAOIndexCount = sundialMesh.indices.size();
+    sundialNode->position = glm::vec3(0.0f); // Center of the scene
+    sundialNode->scale = glm::vec3(0.05f);      // Scale down the model
+    sundialNode->rotation.x = glm::radians(-90.0f);
 
-    boxNode->vertexArrayObjectID = boxVAO;
-    boxNode->VAOIndexCount = box.indices.size();
+    // If the MTL defined a diffuse texture, load it.
+    if (!diffuseTexName.empty()) {
+        // Construct the full path (adjust the base path if needed).
+        std::string texturePath = "../res/models/" + diffuseTexName;
+        unsigned int sundialTex = loadTexture(texturePath);
+        sundialNode->textureID = sundialTex;
+        sundialNode->hasTexture = true;
+    }
 
-    padNode->vertexArrayObjectID = padVAO;
-    padNode->VAOIndexCount = pad.indices.size();
+    rootNode->children.push_back(sundialNode);
 
     getTimeDeltaSeconds();
 
@@ -234,16 +228,6 @@ void updateFrame(GLFWwindow *window)
 
     glm::mat4 identity = glm::mat4(1.0f);
 
-    // Move and rotate various SceneNodes
-    boxNode->position = {0, -10, -80};
-
-
-    padNode->position = {
-        boxNode->position.x - (boxDimensions.x / 2) + (padDimensions.x / 2) + (1 - 0.5f) * (boxDimensions.x - padDimensions.x),
-        boxNode->position.y - (boxDimensions.y / 2) + (padDimensions.y / 2),
-        boxNode->position.z - (boxDimensions.z / 2) + (padDimensions.z / 2) + (1 - 0.5f) * (boxDimensions.z - padDimensions.z)
-    };
-
 
     lightIndex = 0;
 
@@ -306,14 +290,23 @@ void updateNodeTransformations(SceneNode *node, glm::mat4 parentModel, glm::mat4
 
 void renderNode(SceneNode *node)
 {
-
     switch (node->nodeType)
     {
     case GEOMETRY:
         if (node->vertexArrayObjectID != -1)
         {
             glBindVertexArray(node->vertexArrayObjectID);
-
+            
+            // Bind texture if this node has one.
+            if (node->hasTexture && node->textureID != 0) {
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, node->textureID);
+                glUniform1i(glGetUniformLocation(shader->get(), "diffuseTexture"), 0);
+                glUniform1i(glGetUniformLocation(shader->get(), "useTexture"), 1);
+            } else {
+                glUniform1i(glGetUniformLocation(shader->get(), "useTexture"), 0);
+            }
+            
             glUniformMatrix4fv(3, 1, GL_FALSE, glm::value_ptr(node->modelMatrix));
             glUniformMatrix4fv(4, 1, GL_FALSE, glm::value_ptr(node->MVP));
 
