@@ -40,8 +40,12 @@ struct SceneNode {
 	glm::vec3 rotation;
 	glm::vec3 scale;
 
+	// Color of the light
+	glm::vec3 lightColor;
+
 	// A transformation matrix representing the transformation of the node's location relative to its parent. This matrix is updated every frame.
-	glm::mat4 currentTransformationMatrix;
+	glm::mat4 modelMatrix;
+	glm::mat4 MVP;
 
 	// The location of the node's reference point
 	glm::vec3 referencePoint;

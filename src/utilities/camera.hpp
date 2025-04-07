@@ -84,8 +84,8 @@ namespace Gloom
             }
 
             // Keep track of pitch and yaw for the current frame
-            fYaw   = (xpos - lastXPos) * cMouseSensitivity;
-            fPitch = (ypos - lastYPos) * cMouseSensitivity;
+            fYaw   = xpos - lastXPos;
+            fPitch = ypos - lastYPos;
 
             // Update last known cursor position
             lastXPos = xpos;
@@ -143,6 +143,10 @@ namespace Gloom
         /* Update the view matrix based on the current information */
         void updateViewMatrix()
         {
+            // Adjust cursor movement using the specified sensitivity
+            fPitch *= cMouseSensitivity;
+            fYaw   *= cMouseSensitivity;
+
             // Create quaternions given the current pitch and yaw
             glm::quat qPitch = glm::quat(glm::vec3(fPitch, 0.0f, 0.0f));
             glm::quat qYaw   = glm::quat(glm::vec3(0.0f, fYaw, 0.0f));
@@ -152,7 +156,7 @@ namespace Gloom
             fYaw   = 0.0f;
 
             // Update camera quaternion and normalise
-            cQuaternion = qPitch * qYaw * cQuaternion;
+            cQuaternion = qYaw * qPitch * cQuaternion;
             cQuaternion = glm::normalize(cQuaternion);
 
             // Build rotation matrix using the camera quaternion
