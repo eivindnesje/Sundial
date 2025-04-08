@@ -51,7 +51,8 @@ void main()
     projCoords = projCoords * 0.5 + 0.5;
     float closestDepth = texture(shadowMap, projCoords.xy).r;
     float currentDepth = projCoords.z;
-    float bias = max(0.05 * (1.0 - dot(normal, lightDir)), 0.005);
+    // float bias = max(0.05 * (1.0 - dot(normal, lightDir)), 0.001);
+    float bias = max(0.005 * tan(acos(dot(normal, lightDir))), 0.001);
     float shadow = currentDepth - bias > closestDepth ? 0.5 : 1.0;
     
     vec3 litColor = ambientLight + (diffuse + specular) * shadow + emission;

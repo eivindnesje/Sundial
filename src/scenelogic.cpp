@@ -80,8 +80,8 @@ static void initShadowMap() {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT,
                 SHADOW_WIDTH, SHADOW_HEIGHT, 0,
                 GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
     float borderColor[] = {1.0f,1.0f,1.0f,1.0f};
@@ -131,7 +131,7 @@ void initScene(GLFWwindow *window, CommandLineOptions sceneOptions) {
     glfwSetCursorPosCallback(window, mouseCallback);
 
     shader = new Gloom::Shader();
-    shader->makeBasicShader("../res/shaders/simple.vert", "../res/shaders/simple.frag");
+    shader->makeBasicShader("../res/shaders/lighting.vert", "../res/shaders/lighting.frag");
     shader->activate();
 
     shadowShader = new Gloom::Shader();
