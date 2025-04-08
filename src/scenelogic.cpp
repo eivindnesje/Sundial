@@ -1,3 +1,4 @@
+// <scenelogic.cpp>
 #include <GLFW/glfw3.h>
 #include <glad/glad.h>
 #include <iostream>
@@ -13,10 +14,14 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
-// Global scene pointers
+// *** NEW: Include our new skybox header ***
+#include "skybox.hpp"
+
+/// Global scene pointers
 SceneNode *rootNode = nullptr;
 SceneNode *lightNode = nullptr; // Directional light (sun)
 SceneNode *sunNode = nullptr;   // Visible sun
+
 static const int numLights = 1;
 int lightIndex = 0;
 LightSource lightSources[numLights];
@@ -35,6 +40,9 @@ static unsigned int shadowMap = 0;
 static Gloom::Shader *shader = nullptr;
 static Gloom::Shader *shadowShader = nullptr;
 
+// *** NEW: Skybox pointer ***
+static Gloom::Skybox* skybox = nullptr;
+
 CommandLineOptions options;
 
 // Timing variables
@@ -42,9 +50,8 @@ static double totalElapsedTime = 0.0;
 static double sceneElapsedTime = 0.0;
 
 // Sun movement constants
-static const float SIM_SECONDS_PER_REAL_HOUR = 5.0f; 
+static const float SIM_SECONDS_PER_REAL_HOUR = 1.0f; 
 static const float FULL_DAY = 24.0f * SIM_SECONDS_PER_REAL_HOUR;
-
 
 // Mouse control (initial center assumed; adjust as needed)
 static double mouseSensitivity = 0.2;
@@ -71,8 +78,8 @@ static void initShadowMap() {
     glGenTextures(1, &shadowMap);
     glBindTexture(GL_TEXTURE_2D, shadowMap);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT,
-                 SHADOW_WIDTH, SHADOW_HEIGHT, 0,
-                 GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+                SHADOW_WIDTH, SHADOW_HEIGHT, 0,
+                GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
@@ -91,7 +98,6 @@ static void initShadowMap() {
 }
 
 // --- updateNodeTransformations ---
-// This function propagates transformation updates through the scene graph.
 void updateNodeTransformations(SceneNode *node, glm::mat4 parentModel, glm::mat4 parentVP) {
     glm::mat4 transformationMatrix =
         glm::translate(glm::mat4(1.0f), node->position) *
@@ -170,13 +176,25 @@ void initScene(GLFWwindow *window, CommandLineOptions sceneOptions) {
     }
     rootNode->children.push_back(sundialNode);
 
+    // *** NEW: Initialize the Skybox ***
+    {
+        std::vector<std::string> skyFaces = {
+            "../res/textures/skybox/right.jpg",
+            "../res/textures/skybox/left.jpg",
+            "../res/textures/skybox/top.jpg",
+            "../res/textures/skybox/bottom.jpg",
+            "../res/textures/skybox/front.jpg",
+            "../res/textures/skybox/back.jpg"
+        };
+        skybox = new Gloom::Skybox();
+        skybox->init(skyFaces, "../res/shaders/skybox.vert", "../res/shaders/skybox.frag");
+    }
+
     totalElapsedTime = sceneElapsedTime = getTimeDeltaSeconds();
     std::cout << fmt::format("Initialized scene with {} SceneNodes.", totalChildren(rootNode)) << std::endl;
 }
 
-// --- renderShadowScene ---
-// Traverse the scene graph to render the depth map.
-// Skip rendering the visible sun.
+// --- renderShadowScene --- (unchanged)
 static void renderShadowScene(SceneNode *node, glm::mat4 parentModel) {
     if(node == sunNode)
         return;
@@ -197,7 +215,7 @@ static void renderShadowScene(SceneNode *node, glm::mat4 parentModel) {
         renderShadowScene(child, model);
 }
 
-// --- updateFrame ---
+// --- updateFrame --- (unchanged)
 void updateFrame(GLFWwindow *window) {
     double timeDelta = getTimeDeltaSeconds();
     totalElapsedTime += timeDelta;
@@ -214,7 +232,6 @@ void updateFrame(GLFWwindow *window) {
 
     // The sun faces the origin, so the direction is from sunPos to (0,0,0)
     glm::vec3 sunDir = glm::normalize(sunPos);
-
     
     glUniform3f(glGetUniformLocation(shader->get(), "sun.direction"), sunDir.x, sunDir.y, sunDir.z);
     glUniform3f(glGetUniformLocation(shader->get(), "sun.color"),
@@ -236,10 +253,9 @@ void updateFrame(GLFWwindow *window) {
     lightIndex = 0;
     updateNodeTransformations(rootNode, identity, VP);
     glUniform3fv(glGetUniformLocation(shader->get(), "cameraPos"), 1, glm::value_ptr(cameraPos));
-    
 }
 
-// --- renderNode ---
+// --- renderNode --- (unchanged)
 static void renderNode(SceneNode *node) {
     if(node->nodeType == GEOMETRY && node->vertexArrayObjectID != -1) {
         bool isSunGeom = (node == sunNode);
@@ -263,11 +279,20 @@ static void renderNode(SceneNode *node) {
         renderNode(child);
 }
 
-// --- renderFrame ---
 void renderFrame(GLFWwindow *window) {
-    // Shadow Pass
+    int winWidth, winHeight;
+    glfwGetWindowSize(window, &winWidth, &winHeight);
+    glm::vec3 center(0.0f);
+    glm::vec3 cameraPos;
+    cameraPos.x = center.x + cameraRadius * cos(glm::radians(cameraPitch)) * sin(glm::radians(cameraYaw));
+    cameraPos.y = center.y + cameraRadius * sin(glm::radians(cameraPitch));
+    cameraPos.z = center.z + cameraRadius * cos(glm::radians(cameraPitch)) * cos(glm::radians(cameraYaw));
+    glm::mat4 view = glm::lookAt(cameraPos, center, glm::vec3(0, 1, 0));
+    glm::mat4 projection = glm::perspective(glm::radians(80.0f), float(winWidth) / float(winHeight), 0.1f, 350.f);
+    
+    // --- Shadow Pass ---
     glm::mat4 lightProjection = glm::ortho(-150.0f, 150.0f, -150.0f, 150.0f, 1.0f, 400.0f);
-    glm::mat4 lightView = glm::lookAt(lightNode->position, glm::vec3(0,0,0), glm::vec3(0,1,0));
+    glm::mat4 lightView = glm::lookAt(lightNode->position, glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
     glm::mat4 lightSpaceMatrix = lightProjection * lightView;
     glViewport(0, 0, SHADOW_WIDTH, SHADOW_HEIGHT);
     glBindFramebuffer(GL_FRAMEBUFFER, shadowFBO);
@@ -277,9 +302,7 @@ void renderFrame(GLFWwindow *window) {
     renderShadowScene(rootNode, glm::mat4(1.0f));
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    // Main Render Pass
-    int winWidth, winHeight;
-    glfwGetWindowSize(window, &winWidth, &winHeight);
+    // --- Main Render Pass ---
     glViewport(0, 0, winWidth, winHeight);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     shader->activate();
@@ -288,4 +311,7 @@ void renderFrame(GLFWwindow *window) {
     glBindTexture(GL_TEXTURE_2D, shadowMap);
     glUniform1i(glGetUniformLocation(shader->get(), "shadowMap"), 1);
     renderNode(rootNode);
+
+    // *** NEW: Render the skybox last ***
+    skybox->render(view, projection);
 }
