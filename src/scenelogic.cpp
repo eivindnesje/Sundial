@@ -1,4 +1,3 @@
-// <scenelogic.cpp>
 #include <GLFW/glfw3.h>
 #include <glad/glad.h>
 #include <iostream>
@@ -17,11 +16,11 @@
 // *** NEW: Include our new skybox header ***
 #include "skybox.hpp"
 
-/// Global scene pointers
+// Global scene pointers
 SceneNode *rootNode = nullptr;
-SceneNode *lightNode = nullptr; // Directional light (sun)
-SceneNode *sunNode = nullptr;   // Visible sun
+SceneNode *lightNode = nullptr; // Directional light (the only light, which drives both lighting and shadow mapping)
 
+// For the light sources (if needed for further use)
 static const int numLights = 1;
 int lightIndex = 0;
 LightSource lightSources[numLights];
@@ -50,8 +49,11 @@ static double totalElapsedTime = 0.0;
 static double sceneElapsedTime = 0.0;
 
 // Sun movement constants
-static const float SIM_SECONDS_PER_REAL_HOUR = 1.0f; 
+static const float SIM_SECONDS_PER_REAL_HOUR = 1.0f;
 static const float FULL_DAY = 24.0f * SIM_SECONDS_PER_REAL_HOUR;
+
+// NEW: Global sun direction for the skybox animation (and for lighting/shadowing)
+static glm::vec3 skyboxSunDir = glm::vec3(0.0f);
 
 // Mouse control (initial center assumed; adjust as needed)
 static double mouseSensitivity = 0.2;
@@ -78,13 +80,13 @@ static void initShadowMap() {
     glGenTextures(1, &shadowMap);
     glBindTexture(GL_TEXTURE_2D, shadowMap);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT,
-                SHADOW_WIDTH, SHADOW_HEIGHT, 0,
-                GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+                 SHADOW_WIDTH, SHADOW_HEIGHT, 0,
+                 GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
-    float borderColor[] = {1.0f,1.0f,1.0f,1.0f};
+    float borderColor[] = {1.0f, 1.0f, 1.0f, 1.0f};
     glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, borderColor);
 
     glGenFramebuffers(1, &shadowFBO);
@@ -130,10 +132,12 @@ void initScene(GLFWwindow *window, CommandLineOptions sceneOptions) {
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);
     glfwSetCursorPosCallback(window, mouseCallback);
 
+    // Load the lighting shader pair.
     shader = new Gloom::Shader();
-    shader->makeBasicShader("../res/shaders/simple.vert", "../res/shaders/simple.frag");
+    shader->makeBasicShader("../res/shaders/lighting.vert", "../res/shaders/lighting.frag");
     shader->activate();
 
+    // Load the shadow mapping shader pair.
     shadowShader = new Gloom::Shader();
     shadowShader->makeBasicShader("../res/shaders/shadow.vert", "../res/shaders/shadow.frag");
 
@@ -142,23 +146,15 @@ void initScene(GLFWwindow *window, CommandLineOptions sceneOptions) {
     // Create scene graph root.
     rootNode = createSceneNode();
 
-    // Create directional light node (the sun used for lighting).
+    // Create the directional light node.
     lightNode = createSceneNode();
     lightNode->nodeType = POINT_LIGHT;
-    lightNode->position = glm::vec3(0.0f, 100.0f, 50.0f); // Initial value; updated in updateFrame.
+    // Starting value (will be updated in updateFrame).
+    lightNode->position = glm::vec3(0.0f, 100.0f, 50.0f);
     lightNode->lightColor = glm::vec3(1.0f);
     rootNode->children.push_back(lightNode);
 
-    // Create visible sun node.
-    sunNode = createSceneNode();
-    Mesh sunMesh = generateSphere(1.0f, 20, 20);
-    unsigned int sunVAO = generateBuffer(sunMesh);
-    sunNode->vertexArrayObjectID = sunVAO;
-    sunNode->VAOIndexCount = sunMesh.indices.size();
-    sunNode->scale = glm::vec3(10.0f);
-    rootNode->children.push_back(sunNode);
-
-    // Load sundial model.
+    // Load the sundial model.
     std::string diffuseTexName;
     Mesh sundialMesh = loadOBJModel("../res/models/sundial.obj", "../res/models/", diffuseTexName);
     unsigned int sundialVAO = generateBuffer(sundialMesh);
@@ -168,7 +164,7 @@ void initScene(GLFWwindow *window, CommandLineOptions sceneOptions) {
     sundialNode->position = glm::vec3(0.0f);
     sundialNode->scale = glm::vec3(0.5f);
     sundialNode->rotation.x = glm::radians(-90.0f);
-    if(!diffuseTexName.empty()){
+    if (!diffuseTexName.empty()) {
         std::string texturePath = "../res/models/" + diffuseTexName;
         unsigned int tex = loadTexture(texturePath);
         sundialNode->textureID = tex;
@@ -176,7 +172,7 @@ void initScene(GLFWwindow *window, CommandLineOptions sceneOptions) {
     }
     rootNode->children.push_back(sundialNode);
 
-    // *** NEW: Initialize the Skybox ***
+    // *** Initialize the Skybox ***
     {
         std::vector<std::string> skyFaces = {
             "../res/textures/skybox/right.jpg",
@@ -187,6 +183,7 @@ void initScene(GLFWwindow *window, CommandLineOptions sceneOptions) {
             "../res/textures/skybox/back.jpg"
         };
         skybox = new Gloom::Skybox();
+        // (Ensure that your skybox class has been updated if you decide to pass sun direction.)
         skybox->init(skyFaces, "../res/shaders/skybox.vert", "../res/shaders/skybox.frag");
     }
 
@@ -194,10 +191,8 @@ void initScene(GLFWwindow *window, CommandLineOptions sceneOptions) {
     std::cout << fmt::format("Initialized scene with {} SceneNodes.", totalChildren(rootNode)) << std::endl;
 }
 
-// --- renderShadowScene --- (unchanged)
+// --- renderShadowScene ---
 static void renderShadowScene(SceneNode *node, glm::mat4 parentModel) {
-    if(node == sunNode)
-        return;
     glm::mat4 model = parentModel *
         glm::translate(glm::mat4(1.0f), node->position) *
         glm::translate(glm::mat4(1.0f), node->referencePoint) *
@@ -215,30 +210,26 @@ static void renderShadowScene(SceneNode *node, glm::mat4 parentModel) {
         renderShadowScene(child, model);
 }
 
-// --- updateFrame --- (unchanged)
+// --- updateFrame ---
 void updateFrame(GLFWwindow *window) {
     double timeDelta = getTimeDeltaSeconds();
     totalElapsedTime += timeDelta;
     sceneElapsedTime += timeDelta;
 
-    float angularSpeed = 2.0f * glm::pi<float>() / FULL_DAY;
-    float angle = angularSpeed * sceneElapsedTime;
+    // Compute day progress (in [0,1]) and animate the sun direction.
+    double dayProgress = fmod(sceneElapsedTime, FULL_DAY) / FULL_DAY;
+    float theta = 2.0f * glm::pi<float>() * (dayProgress);
+    const float orbitRadius = 3.0f;
+    const float zOffset = 1.0f;
+    glm::vec3 sunPos(orbitRadius * cos(theta), orbitRadius * sin(theta), zOffset);
+    skyboxSunDir = glm::normalize(sunPos);
 
-    // Sun moves on a circular path in the xy plane with a constant z offset
-    float orbitRadius = 150.0f;
-    float zOffset = 50.0f; // Constant positive z direction
-    glm::vec3 sunPos(orbitRadius * cos(angle), orbitRadius * sin(angle), zOffset);
-    lightNode->position = sunPos;
+    // Update the light node so that it comes from the same direction.
+    // For directional lights, we set the light's position far along the negative sun direction.
+    float lightDistance = 300.0f; // Adjust as needed
+    lightNode->position = -skyboxSunDir * lightDistance;
 
-    // The sun faces the origin, so the direction is from sunPos to (0,0,0)
-    glm::vec3 sunDir = glm::normalize(sunPos);
-    
-    glUniform3f(glGetUniformLocation(shader->get(), "sun.direction"), sunDir.x, sunDir.y, sunDir.z);
-    glUniform3f(glGetUniformLocation(shader->get(), "sun.color"),
-                lightNode->lightColor.x, lightNode->lightColor.y, lightNode->lightColor.z);
-    sunNode->position = lightNode->position;
-
-    // Update camera.
+    // Update camera parameters as before.
     int winWidth, winHeight;
     glfwGetWindowSize(window, &winWidth, &winHeight);
     glm::vec3 center(0.0f);
@@ -247,7 +238,7 @@ void updateFrame(GLFWwindow *window) {
     cameraPos.y = center.y + cameraRadius * sin(glm::radians(cameraPitch));
     cameraPos.z = center.z + cameraRadius * cos(glm::radians(cameraPitch)) * cos(glm::radians(cameraYaw));
     glm::mat4 view = glm::lookAt(cameraPos, center, glm::vec3(0,1,0));
-    glm::mat4 projection = glm::perspective(glm::radians(80.0f), float(winWidth)/float(winHeight), 0.1f, 350.f);
+    glm::mat4 projection = glm::perspective(glm::radians(80.0f), float(winWidth) / float(winHeight), 0.1f, 350.f);
     glm::mat4 VP = projection * view;
     glm::mat4 identity = glm::mat4(1.0f);
     lightIndex = 0;
@@ -255,11 +246,9 @@ void updateFrame(GLFWwindow *window) {
     glUniform3fv(glGetUniformLocation(shader->get(), "cameraPos"), 1, glm::value_ptr(cameraPos));
 }
 
-// --- renderNode --- (unchanged)
+// --- renderNode ---
 static void renderNode(SceneNode *node) {
     if(node->nodeType == GEOMETRY && node->vertexArrayObjectID != -1) {
-        bool isSunGeom = (node == sunNode);
-        glUniform1i(glGetUniformLocation(shader->get(), "isSun"), isSunGeom ? 1 : 0);
         glBindVertexArray(node->vertexArrayObjectID);
         if(node->hasTexture && node->textureID != 0) {
             glActiveTexture(GL_TEXTURE0);
@@ -289,10 +278,15 @@ void renderFrame(GLFWwindow *window) {
     cameraPos.z = center.z + cameraRadius * cos(glm::radians(cameraPitch)) * cos(glm::radians(cameraYaw));
     glm::mat4 view = glm::lookAt(cameraPos, center, glm::vec3(0, 1, 0));
     glm::mat4 projection = glm::perspective(glm::radians(80.0f), float(winWidth) / float(winHeight), 0.1f, 350.f);
-    
+
     // --- Shadow Pass ---
-    glm::mat4 lightProjection = glm::ortho(-150.0f, 150.0f, -150.0f, 150.0f, 1.0f, 400.0f);
-    glm::mat4 lightView = glm::lookAt(lightNode->position, glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
+    // Expand the orthographic frustum (adjust the boundaries if needed for your scene)
+    float orthoSize = 150.0f;
+    glm::mat4 lightProjection = glm::ortho(-orthoSize, orthoSize, -orthoSize, orthoSize, 1.0f, 400.0f);
+    // Compute the light view matrix using an appropriate up vector.
+    glm::vec3 lightUp = (fabs(skyboxSunDir.y) < 0.999f) ? glm::vec3(0.0f, 1.0f, 0.0f)
+                                                        : glm::vec3(0.0f, 0.0f, 1.0f);
+    glm::mat4 lightView = glm::lookAt(lightNode->position, glm::vec3(0, 0, 0), lightUp);
     glm::mat4 lightSpaceMatrix = lightProjection * lightView;
     glViewport(0, 0, SHADOW_WIDTH, SHADOW_HEIGHT);
     glBindFramebuffer(GL_FRAMEBUFFER, shadowFBO);
@@ -305,13 +299,25 @@ void renderFrame(GLFWwindow *window) {
     // --- Main Render Pass ---
     glViewport(0, 0, winWidth, winHeight);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
     shader->activate();
-    glUniformMatrix4fv(glGetUniformLocation(shader->get(), "lightSpaceMatrix"), 1, GL_FALSE, glm::value_ptr(lightSpaceMatrix));
+    // Update the lighting uniforms with our new sun direction and light color.
+    glUniform3f(glGetUniformLocation(shader->get(), "sunDir"),
+                skyboxSunDir.x, skyboxSunDir.y, skyboxSunDir.z);
+    glUniform3f(glGetUniformLocation(shader->get(), "sunColor"),
+                lightNode->lightColor.x, lightNode->lightColor.y, lightNode->lightColor.z);
+    glUniformMatrix4fv(glGetUniformLocation(shader->get(), "lightSpaceMatrix"),
+                       1, GL_FALSE, glm::value_ptr(lightSpaceMatrix));
+
+    // Bind the shadow map texture.
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, shadowMap);
     glUniform1i(glGetUniformLocation(shader->get(), "shadowMap"), 1);
+
+    // Render scene objects (the sundial and others).
     renderNode(rootNode);
 
-    // *** NEW: Render the skybox last ***
-    skybox->render(view, projection);
+    // Render the skybox.
+    // (If you update your skybox shader to take the sun direction as a parameter, call it here.)
+    skybox->render(view, projection, skyboxSunDir);
 }
