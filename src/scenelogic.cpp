@@ -1,4 +1,3 @@
-// <scenelogic.cpp>
 #include <GLFW/glfw3.h>
 #include <glad/glad.h>
 #include <iostream>
@@ -17,10 +16,10 @@
 // *** NEW: Include our new skybox header ***
 #include "skybox.hpp"
 
-/// Global scene pointers
+// Global scene pointers
 SceneNode *rootNode = nullptr;
-SceneNode *lightNode = nullptr; // Directional light (sun)
-SceneNode *sunNode = nullptr;   // Visible sun
+SceneNode *lightNode = nullptr; // Directional light (sun used for lighting)
+SceneNode *sunNode = nullptr;   // Visible sun node
 
 static const int numLights = 1;
 int lightIndex = 0;
@@ -37,8 +36,12 @@ static unsigned int shadowFBO = 0;
 static unsigned int shadowMap = 0;
 
 // Shaders
-static Gloom::Shader *shader = nullptr;
-static Gloom::Shader *shadowShader = nullptr;
+static Gloom::Shader *shader = nullptr;         // Regular scene shader (lighting etc.)
+static Gloom::Shader *shadowShader = nullptr;     // Shadow mapping shader
+static Gloom::Shader *sunShader = nullptr;        // *** NEW: Sun shader for emissive glow ***
+
+// *** NEW: Global variable to store computed sun color (emissive color) ***
+static glm::vec3 sunColorUniform = glm::vec3(1.0f);
 
 // *** NEW: Skybox pointer ***
 static Gloom::Skybox* skybox = nullptr;
@@ -50,7 +53,7 @@ static double totalElapsedTime = 0.0;
 static double sceneElapsedTime = 0.0;
 
 // Sun movement constants
-static const float SIM_SECONDS_PER_REAL_HOUR = 1.0f; 
+static const float SIM_SECONDS_PER_REAL_HOUR = 1.0f;
 static const float FULL_DAY = 24.0f * SIM_SECONDS_PER_REAL_HOUR;
 
 // Mouse control (initial center assumed; adjust as needed)
@@ -78,13 +81,13 @@ static void initShadowMap() {
     glGenTextures(1, &shadowMap);
     glBindTexture(GL_TEXTURE_2D, shadowMap);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT,
-                SHADOW_WIDTH, SHADOW_HEIGHT, 0,
-                GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                 SHADOW_WIDTH, SHADOW_HEIGHT, 0,
+                 GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
-    float borderColor[] = {1.0f,1.0f,1.0f,1.0f};
+    float borderColor[] = {1.0f, 1.0f, 1.0f, 1.0f};
     glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, borderColor);
 
     glGenFramebuffers(1, &shadowFBO);
@@ -130,12 +133,20 @@ void initScene(GLFWwindow *window, CommandLineOptions sceneOptions) {
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);
     glfwSetCursorPosCallback(window, mouseCallback);
 
+    // Regular lighting shader.
     shader = new Gloom::Shader();
     shader->makeBasicShader("../res/shaders/lighting.vert", "../res/shaders/lighting.frag");
     shader->activate();
 
+    // Shadow mapping shader.
     shadowShader = new Gloom::Shader();
     shadowShader->makeBasicShader("../res/shaders/shadow.vert", "../res/shaders/shadow.frag");
+
+    // *** NEW: Sun shader for the glowing sun. ***
+    // sun.vert and sun.frag should implement a simple emissive pass.
+    // For example, sun.vert transforms vertices and sun.frag outputs the uniform sunColor.
+    sunShader = new Gloom::Shader();
+    sunShader->makeBasicShader("../res/shaders/sun.vert", "../res/shaders/sun.frag");
 
     initShadowMap();
 
@@ -145,17 +156,18 @@ void initScene(GLFWwindow *window, CommandLineOptions sceneOptions) {
     // Create directional light node (the sun used for lighting).
     lightNode = createSceneNode();
     lightNode->nodeType = POINT_LIGHT;
-    lightNode->position = glm::vec3(0.0f, 100.0f, 50.0f); // Initial value; updated in updateFrame.
+    lightNode->position = glm::vec3(0.0f, 100.0f, 50.0f); // Initial value; will be updated in updateFrame.
     lightNode->lightColor = glm::vec3(1.0f);
     rootNode->children.push_back(lightNode);
 
     // Create visible sun node.
     sunNode = createSceneNode();
-    Mesh sunMesh = generateSphere(1.0f, 20, 20);
+    Mesh sunMesh = generateSphere(1.0f, 10, 10);
     unsigned int sunVAO = generateBuffer(sunMesh);
     sunNode->vertexArrayObjectID = sunVAO;
     sunNode->VAOIndexCount = sunMesh.indices.size();
     sunNode->scale = glm::vec3(10.0f);
+    // Note: The sun node will be rendered separately with sunShader.
     rootNode->children.push_back(sunNode);
 
     // Load sundial model.
@@ -215,7 +227,7 @@ static void renderShadowScene(SceneNode *node, glm::mat4 parentModel) {
         renderShadowScene(child, model);
 }
 
-// --- updateFrame --- (unchanged)
+// --- updateFrame --- (modified to compute sun color)
 void updateFrame(GLFWwindow *window) {
     double timeDelta = getTimeDeltaSeconds();
     totalElapsedTime += timeDelta;
@@ -224,19 +236,26 @@ void updateFrame(GLFWwindow *window) {
     float angularSpeed = 2.0f * glm::pi<float>() / FULL_DAY;
     float angle = angularSpeed * sceneElapsedTime;
 
-    // Sun moves on a circular path in the xy plane with a constant z offset
+    // Sun moves on a circular path in the xy plane with a constant z offset.
     float orbitRadius = 150.0f;
-    float zOffset = 50.0f; // Constant positive z direction
+    float zOffset = 50.0f; // Constant positive z direction.
     glm::vec3 sunPos(orbitRadius * cos(angle), orbitRadius * sin(angle), zOffset);
     lightNode->position = sunPos;
 
-    // The sun faces the origin, so the direction is from sunPos to (0,0,0)
+    // The sun light (directional light) points from the sun position toward the origin.
     glm::vec3 sunDir = glm::normalize(sunPos);
-    
     glUniform3f(glGetUniformLocation(shader->get(), "sun.direction"), sunDir.x, sunDir.y, sunDir.z);
     glUniform3f(glGetUniformLocation(shader->get(), "sun.color"),
                 lightNode->lightColor.x, lightNode->lightColor.y, lightNode->lightColor.z);
+    // Update the visible sun node’s position.
+    
     sunNode->position = lightNode->position;
+    float t = sunPos.y / 150.0f;       // Normalized value: 1.0 when at max height.
+    t = glm::clamp(t, 0.3f, 1.0f);     // Clamp so brightness never falls below 0.3.
+    glm::vec3 colorOrange(1.0f, 0.5f, 0.0f);
+    glm::vec3 colorYellow(1.0f, 1.0f, 0.0f);
+    sunColorUniform = glm::mix(colorOrange, colorYellow, t);
+
 
     // Update camera.
     int winWidth, winHeight;
@@ -246,7 +265,7 @@ void updateFrame(GLFWwindow *window) {
     cameraPos.x = center.x + cameraRadius * cos(glm::radians(cameraPitch)) * sin(glm::radians(cameraYaw));
     cameraPos.y = center.y + cameraRadius * sin(glm::radians(cameraPitch));
     cameraPos.z = center.z + cameraRadius * cos(glm::radians(cameraPitch)) * cos(glm::radians(cameraYaw));
-    glm::mat4 view = glm::lookAt(cameraPos, center, glm::vec3(0,1,0));
+    glm::mat4 view = glm::lookAt(cameraPos, center, glm::vec3(0, 1, 0));
     glm::mat4 projection = glm::perspective(glm::radians(80.0f), float(winWidth)/float(winHeight), 0.1f, 350.f);
     glm::mat4 VP = projection * view;
     glm::mat4 identity = glm::mat4(1.0f);
@@ -255,11 +274,13 @@ void updateFrame(GLFWwindow *window) {
     glUniform3fv(glGetUniformLocation(shader->get(), "cameraPos"), 1, glm::value_ptr(cameraPos));
 }
 
-// --- renderNode --- (unchanged)
+// --- renderNode ---
+// Modified to skip rendering the sun node (so that it’s drawn separately)
 static void renderNode(SceneNode *node) {
-    if(node->nodeType == GEOMETRY && node->vertexArrayObjectID != -1) {
-        bool isSunGeom = (node == sunNode);
-        glUniform1i(glGetUniformLocation(shader->get(), "isSun"), isSunGeom ? 1 : 0);
+    if(node == sunNode) {
+        // Skip sunNode here; it will be rendered by renderSun.
+    } else if(node->nodeType == GEOMETRY && node->vertexArrayObjectID != -1) {
+        glUniform1i(glGetUniformLocation(shader->get(), "isSun"), 0);
         glBindVertexArray(node->vertexArrayObjectID);
         if(node->hasTexture && node->textureID != 0) {
             glActiveTexture(GL_TEXTURE0);
@@ -279,6 +300,18 @@ static void renderNode(SceneNode *node) {
         renderNode(child);
 }
 
+// --- renderSun --- *** NEW: Renders the sun using the sunShader.
+static void renderSun(const glm::mat4 &viewProjection) {
+    if(!sunNode) return;
+    sunShader->activate();
+    glUniformMatrix4fv(glGetUniformLocation(sunShader->get(), "modelMatrix"), 1, GL_FALSE, glm::value_ptr(sunNode->modelMatrix));
+    glUniformMatrix4fv(glGetUniformLocation(sunShader->get(), "viewProjection"), 1, GL_FALSE, glm::value_ptr(viewProjection));
+    glUniform3fv(glGetUniformLocation(sunShader->get(), "sunColor"), 1, glm::value_ptr(sunColorUniform));
+    glBindVertexArray(sunNode->vertexArrayObjectID);
+    glDrawElements(GL_TRIANGLES, sunNode->VAOIndexCount, GL_UNSIGNED_INT, nullptr);
+    sunShader->deactivate();
+}
+
 void renderFrame(GLFWwindow *window) {
     int winWidth, winHeight;
     glfwGetWindowSize(window, &winWidth, &winHeight);
@@ -289,17 +322,23 @@ void renderFrame(GLFWwindow *window) {
     cameraPos.z = center.z + cameraRadius * cos(glm::radians(cameraPitch)) * cos(glm::radians(cameraYaw));
     glm::mat4 view = glm::lookAt(cameraPos, center, glm::vec3(0, 1, 0));
     glm::mat4 projection = glm::perspective(glm::radians(80.0f), float(winWidth) / float(winHeight), 0.1f, 350.f);
+    glm::mat4 VP = projection * view;
     
     // --- Shadow Pass ---
-    glm::mat4 lightProjection = glm::ortho(-150.0f, 150.0f, -150.0f, 150.0f, 1.0f, 400.0f);
+    // Adjust near and far planes to encapsulate the depth range of your scene.
+    glm::mat4 lightProjection = glm::ortho(-150.0f, 150.0f, -150.0f, 150.0f, 20.0f, 250.0f);
     glm::mat4 lightView = glm::lookAt(lightNode->position, glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
     glm::mat4 lightSpaceMatrix = lightProjection * lightView;
     glViewport(0, 0, SHADOW_WIDTH, SHADOW_HEIGHT);
     glBindFramebuffer(GL_FRAMEBUFFER, shadowFBO);
     glClear(GL_DEPTH_BUFFER_BIT);
     shadowShader->activate();
+    // Enable polygon offset to reduce edge artifacts.
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(2.0f, 8.0f);
     glUniformMatrix4fv(glGetUniformLocation(shadowShader->get(), "lightSpaceMatrix"), 1, GL_FALSE, glm::value_ptr(lightSpaceMatrix));
     renderShadowScene(rootNode, glm::mat4(1.0f));
+    glDisable(GL_POLYGON_OFFSET_FILL);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     // --- Main Render Pass ---
@@ -311,7 +350,9 @@ void renderFrame(GLFWwindow *window) {
     glBindTexture(GL_TEXTURE_2D, shadowMap);
     glUniform1i(glGetUniformLocation(shader->get(), "shadowMap"), 1);
     renderNode(rootNode);
-
-    // *** NEW: Render the skybox last ***
+    // Render the skybox last.
     skybox->render(view, projection);
+
+    // *** NEW: Render the sun after the main geometry.
+    renderSun(VP);
 }
