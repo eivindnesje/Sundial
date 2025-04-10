@@ -46,7 +46,7 @@ CommandLineOptions options;
 static double elpasedTime = 0.0;
 
 // Simulation speed
-static const float SIM_SECONDS_PER_REAL_HOUR = 2.0f;
+static const float SIM_SECONDS_PER_REAL_HOUR = 1.0f;
 static const float FULL_DAY = 24.0f * SIM_SECONDS_PER_REAL_HOUR;
 
 // Sun direction
@@ -86,6 +86,7 @@ static void mouseCallback(GLFWwindow* window, double x, double y) {
 
 
 static void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
+    (void)mods;
     // Toggle revolving mode on left button press.
     if(button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
         
@@ -218,6 +219,9 @@ void initScene(GLFWwindow *window, CommandLineOptions sceneOptions) {
     elpasedTime = getTimeDeltaSeconds();
     
     std::cout << fmt::format("Initialized scene with {} SceneNodes.", totalChildren(rootNode)) << std::endl;
+
+    
+    std::cout << "Click to toggle between rotating camera and manual camera" << std::endl;
 }
 
 
@@ -273,7 +277,7 @@ void updateFrame(GLFWwindow *window) {
     glm::vec3 center(0.0f);
 
     if(revolvingMode) {
-        cameraYaw += 5.0f * (float)timeDelta;  
+        cameraYaw += 10.0f * (float)timeDelta;  
     }
     float effectivePitch = revolvingMode ? fixedRevolvePitch : cameraPitch;
 
