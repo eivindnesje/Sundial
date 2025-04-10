@@ -118,7 +118,7 @@ void Skybox::init(const std::vector<std::string>& faces,
     shader->makeBasicShader(shaderVertPath, shaderFragPath);
 }
 
-void Skybox::render(const glm::mat4& view, const glm::mat4& projection, const glm::vec3 skyboxSunDir)
+void Skybox::render(const glm::mat4& view, const glm::mat4& projection, const glm::vec3 sunDir)
 {
     // Change depth function so that skybox fragments are drawn where no geometry exists.
     glDepthFunc(GL_LEQUAL);
@@ -130,7 +130,7 @@ void Skybox::render(const glm::mat4& view, const glm::mat4& projection, const gl
     glUniformMatrix4fv(glGetUniformLocation(shader->get(), "projection"), 1, GL_FALSE, glm::value_ptr(projection));
 
     // NEW: Pass the sun direction to the skybox shader.
-    glUniform3fv(glGetUniformLocation(shader->get(), "sunDir"), 1, glm::value_ptr(skyboxSunDir));
+    glUniform3fv(glGetUniformLocation(shader->get(), "sunDir"), 1, glm::value_ptr(sunDir));
     
     glBindVertexArray(VAO);
     glActiveTexture(GL_TEXTURE0);

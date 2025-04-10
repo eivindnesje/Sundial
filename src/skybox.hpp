@@ -24,7 +24,7 @@ namespace Gloom {
 
         // Renders the skybox.
         // The view matrix should have the translation removed (this is done internally).
-        void render(const glm::mat4& view, const glm::mat4& projection,  const glm::vec3 skyboxSunDir);
+        void render(const glm::mat4& view, const glm::mat4& projection,  const glm::vec3 sunDir);
 
     private:
         unsigned int cubemapTexture;

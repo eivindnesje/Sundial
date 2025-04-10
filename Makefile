@@ -10,8 +10,8 @@ help:
 .PHONY: run run-with-music run-debug
 run: build
 	cd build && ./glowbox
-run-with-music: build
-	cd build && ./glowbox --enable-music
+run-autorotate: build
+	cd build && ./glowbox --autorotate
 run-debug: build-debug | has-gdb
 	cd build-debug && gdb -batch $(GDB_OPTS) -ex "run" -ex "backtrace" ./glowbox
 
