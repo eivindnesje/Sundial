@@ -17,7 +17,6 @@ out vec4 color;
 
 void main()
 {
-    // Normalize the interpolated normal
     vec3 normal = normalize(normal_out);
     
     // Set up basic material parameters
@@ -56,6 +55,7 @@ void main()
     // Hard comparison: if the current depth (minus bias) is greater than the stored depth, the fragment is in shadow.
     float shadow = currentDepth - bias > closestDepth ? 0.0 : 1.0;
 
+    // Dim the light at night
     float sunIntensity = smoothstep(-0.1, 0.3, sunDir.y);
 
     // Combine the lighting components using the shadow factor
