@@ -1,31 +1,19 @@
-# TDT4230 - Graphics and Visualization
+# Interactive OpenGL 3D Scene
 
-This is the base code for the NTNU subject TDT4230 assignments. It may also be used for the final project, which we will showcase [here](https://www.idi.ntnu.no/grupper/vis/teaching/)
+This project is an interactive 3D scene that demonstrates advanced computer graphics techniques including dynamic lighting, real-time shadow mapping, and a static skybox with an animated sun.
 
-## What do i do?
+## How to Run
 
-	git clone --recursive https://github.com/bartvbl/TDT4230-Assignment-1.git
+1. Use the code from https://github.com/bartvbl/TDT4230-Assignment-1.git to build get all the missing data
 
-Should you forget the `--recursive` bit, just run:
+2. Build the project:
 
-	git submodule update --init
+make -B build
 
+3. Run the program:
 
-### Windows
+make run
 
-Install Microsoft Visual Studio Express and CMake.
-You may use CMake-gui or the command-line cmake to generate a Visual Studio solution.
+or for automatic revolving camera mode:
 
-### Linux:
-
-Make sure you have a C/C++ compiler such as  GCC, CMake and Git.
-
-	make run
-
-which is equivalent to
-
-	git submodule update --init
-	cd build
-	cmake ..
-	make
-	./glowbox
+make run-autorotate

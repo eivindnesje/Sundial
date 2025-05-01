@@ -1,0 +1,2006 @@
+<src>
+    <scenelogic.cpp>
+        #include <GLFW/glfw3.h>
+#include <glad/glad.h>
+#include <iostream>
+#include <fmt/format.h>
+#include "scenelogic.h"
+#include "sceneGraph.hpp"
+#include "utilities/timeutils.h"
+#include "utilities/shader.hpp"
+#include "utilities/modelLoader.hpp"
+#include "utilities/textureLoader.hpp"
+#include "utilities/shapes.h"
+#include "utilities/glutils.h"
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include "skybox.hpp"
+
+// Global scene pointers
+SceneNode *rootNode;
+SceneNode *lightNode;
+SceneNode *sundialNode;
+
+// Camera parameters
+static glm::vec3 cameraPos;
+float cameraYaw = 0.0f;
+float cameraPitch = 25.0f;
+const float cameraRadius = 200.0f;
+static bool revolvingMode = false;
+static float fixedRevolvePitch = cameraPitch; 
+
+// Shadow mapping
+const unsigned int SHADOW_WIDTH = 1024, SHADOW_HEIGHT = 1024;
+static unsigned int shadowFBO = 0;
+static unsigned int shadowMap = 0;
+
+// Shaders
+static Gloom::Shader *shader;
+static Gloom::Shader *shadowShader;
+
+// Skybox
+static Gloom::Skybox* skybox;
+
+// Options
+CommandLineOptions options;
+
+// Timing variables
+static double elpasedTime = 0.0;
+
+// Simulation speed
+static const float SIM_SECONDS_PER_REAL_HOUR = 1.0f;
+static const float FULL_DAY = 24.0f * SIM_SECONDS_PER_REAL_HOUR;
+
+// Sun direction
+static glm::vec3 sunDir = glm::vec3(0.0f);
+
+// Matrices
+static glm::mat4 view;
+static glm::mat4 projection;
+static glm::mat4 lightSpaceMatrix;
+
+// Mouse control
+static double mouseSensitivity = 0.2;
+static double lastMouseX = 800.0;
+static double lastMouseY = 600.0;
+
+
+static void mouseCallback(GLFWwindow* window, double x, double y) {
+    // Skip if revolving mode
+    if (revolvingMode) return;
+
+    int winWidth, winHeight;
+    glfwGetWindowSize(window, &winWidth, &winHeight);
+
+    double deltaX = x - lastMouseX;
+    double deltaY = y - lastMouseY;
+
+    // Moves the camera in a "sphere" around the origo
+    cameraYaw   += mouseSensitivity * deltaX;
+    cameraPitch += mouseSensitivity * deltaY;
+    if(cameraPitch > 89.0f)  cameraPitch = 89.0f;
+    if(cameraPitch < -89.0f) cameraPitch = -89.0f;
+
+    glfwSetCursorPos(window, winWidth/2, winHeight/2);
+    lastMouseX = winWidth/2;
+    lastMouseY = winHeight/2;
+}
+
+
+static void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
+    (void)mods;
+    // Toggle revolving mode on left button press.
+    if(button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
+        
+        revolvingMode = !revolvingMode;
+        if(revolvingMode) {
+            // On switching to revolving mode, capture the current pitch so the height stays fixed.
+            fixedRevolvePitch = cameraPitch;
+        }
+        else {
+            // Reset mouse position for manual camera control
+            int winWidth, winHeight;
+            glfwGetWindowSize(window, &winWidth, &winHeight);
+            glfwSetCursorPos(window, winWidth/2, winHeight/2);
+            lastMouseX = winWidth/2;
+            lastMouseY = winHeight/2;
+        }
+    }
+}
+
+
+static void initShadowMap() {
+    glGenTextures(1, &shadowMap);
+    // Bind the newly created texture as a 2D texture
+    glBindTexture(GL_TEXTURE_2D, shadowMap);
+    
+    // Setting the texture as a depthmap
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT,
+                 SHADOW_WIDTH, SHADOW_HEIGHT, 0,
+                 GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    
+    // Configure the texture wrapping mode
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+    
+    // Border color used when texture coordinates fall outside [0,1]
+    float borderColor[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, borderColor);
+
+    // Generate a FBO for rendering the shadow map
+    glGenFramebuffers(1, &shadowFBO);
+    glBindFramebuffer(GL_FRAMEBUFFER, shadowFBO);
+    
+    // Attach the shadow map texture as the depth attachment for the FBO
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, shadowMap, 0);
+    
+    // Disabling both drawing and reading color buffers
+    glDrawBuffer(GL_NONE);
+    glReadBuffer(GL_NONE);
+    
+    // Check if the framebuffer is complete; if not, output an error.
+    if(glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        std::cerr << "Shadow framebuffer not complete!" << std::endl;
+    
+    // Unbinding
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void initScene(GLFWwindow *window, CommandLineOptions sceneOptions) {
+    options = sceneOptions;
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);
+    glfwSetCursorPosCallback(window, mouseCallback);
+    glfwSetMouseButtonCallback(window, mouseButtonCallback);
+
+    // Enable revolving mode if autorotation is activated
+    if(options.autorotate) {
+        revolvingMode = true;
+    }
+    
+    // Load and activate the main shader pair
+    shader = new Gloom::Shader();
+    shader->makeBasicShader("../res/shaders/main.vert", "../res/shaders/main.frag");
+    shader->activate();
+
+    // Load the shadow mapping shader pair
+    shadowShader = new Gloom::Shader();
+    shadowShader->makeBasicShader("../res/shaders/shadow.vert", "../res/shaders/shadow.frag");
+
+    // Initialize the shadowmap
+    initShadowMap();
+
+    rootNode = createSceneNode();
+
+    // Create a scene node for the lightnode (sunlight)
+    lightNode = createSceneNode();
+    lightNode->nodeType = POINT_LIGHT;
+    lightNode->position = glm::vec3(0.0f, 100.0f, 50.0f);
+    lightNode->lightColor = glm::vec3(1.0f);
+    rootNode->children.push_back(lightNode);
+
+    // Load the sundial model
+    std::string diffuseTexName;
+    Mesh sundialMesh = loadOBJModel("../res/models/sundial.obj", "../res/models/", diffuseTexName);
+    // Generate and configure the VAO for the sundial
+    unsigned int sundialVAO = generateBuffer(sundialMesh);
+
+    // Create a scene node for the sundial model
+    sundialNode = createSceneNode();
+    sundialNode->vertexArrayObjectID = sundialVAO;
+    sundialNode->VAOIndexCount = sundialMesh.indices.size();
+    sundialNode->position = glm::vec3(0.0f);
+    sundialNode->scale = glm::vec3(0.5f);
+    sundialNode->rotation.x = glm::radians(-90.0f);
+
+    // If a diffuse texture was loaded, assign it to the sundial node.
+    if (!diffuseTexName.empty()) {
+        std::string texturePath = "../res/textures/" + diffuseTexName;
+        unsigned int tex = loadTexture(texturePath);
+        sundialNode->textureID = tex;
+        sundialNode->hasTexture = true;
+    }
+    // Attach the sundial node to the scene graph.
+    rootNode->children.push_back(sundialNode);
+
+
+    // Define the file paths for the six faces of the skybox.
+    std::vector<std::string> skyFaces = {
+        "../res/textures/skybox/right.jpg",
+        "../res/textures/skybox/left.jpg",
+        "../res/textures/skybox/top.jpg",
+        "../res/textures/skybox/bottom.jpg",
+        "../res/textures/skybox/front.jpg",
+        "../res/textures/skybox/back.jpg"
+    };
+    // Create and initialize the skybox.
+    skybox = new Gloom::Skybox();
+    skybox->init(skyFaces, "../res/shaders/skybox.vert", "../res/shaders/skybox.frag");
+    
+    elpasedTime = getTimeDeltaSeconds();
+    
+    std::cout << fmt::format("Initialized scene with {} SceneNodes.", totalChildren(rootNode)) << std::endl;
+
+    
+    std::cout << "Click to toggle between rotating camera and manual camera" << std::endl;
+}
+
+
+void updateNodeTransformations(SceneNode *node, glm::mat4 parentModel, glm::mat4 parentVP) {
+    // Build the local transformation matrix for the current node:
+    // 1. Translate by the node's position
+    // 2. Translate by the node's reference point (used for pivot adjustments)
+    // 3. Rotate around the Y axis using the node's rotation.y
+    // 4. Rotate around the X axis using the node's rotation.x
+    // 5. Rotate around the Z axis using the node's rotation.z
+    // 6. Scale the node uniformly or non-uniformly as specified
+    // 7. Translate back by the negative reference point to retain pivot correctness
+    glm::mat4 transformationMatrix =
+        glm::translate(glm::mat4(1.0f), node->position) *
+        glm::translate(glm::mat4(1.0f), node->referencePoint) *
+        glm::rotate(glm::mat4(1.0f), node->rotation.y, glm::vec3(0, 1, 0)) *
+        glm::rotate(glm::mat4(1.0f), node->rotation.x, glm::vec3(1, 0, 0)) *
+        glm::rotate(glm::mat4(1.0f), node->rotation.z, glm::vec3(0, 0, 1)) *
+        glm::scale(glm::mat4(1.0f), node->scale) *
+        glm::translate(glm::mat4(1.0f), -node->referencePoint);
+        
+    // Combine parent's model matrix with the current node's transformation matrix.
+    node->modelMatrix = parentModel * transformationMatrix;
+    
+    // Compute Model View Projection matrix
+    node->MVP = parentVP * transformationMatrix;
+
+    // Recursively update transformations for each child of the current node.
+    for(auto child : node->children)
+        updateNodeTransformations(child, node->modelMatrix, node->MVP);
+}
+
+// --- updateFrame ---
+void updateFrame(GLFWwindow *window) {
+    double timeDelta = getTimeDeltaSeconds();
+    elpasedTime += timeDelta;
+
+    float angularSpeed = 2.0f * glm::pi<float>() / FULL_DAY;
+    float angle = angularSpeed * elpasedTime;
+
+    // Sun moves on a circular path in the xy plane with a constant z offset
+    float orbitRadius = 200.0f;
+    float zOffset = 70.0f;
+    glm::vec3 sunPos(orbitRadius * cos(angle), orbitRadius * sin(angle), zOffset);
+    lightNode->position = sunPos;
+    
+    // The sun faces the origin, so the direction is from sunPos to (0,0,0)
+    sunDir = glm::normalize(sunPos);
+
+    // Update camera parameters as before.
+    int winWidth, winHeight;
+    glfwGetWindowSize(window, &winWidth, &winHeight);
+    glm::vec3 center(0.0f);
+
+    if(revolvingMode) {
+        cameraYaw += 10.0f * (float)timeDelta;  
+    }
+    float effectivePitch = revolvingMode ? fixedRevolvePitch : cameraPitch;
+
+    cameraPos.x = center.x + cameraRadius * cos(glm::radians(effectivePitch)) * sin(glm::radians(cameraYaw));
+    cameraPos.y = center.y + cameraRadius * sin(glm::radians(effectivePitch));
+    cameraPos.z = center.z + cameraRadius * cos(glm::radians(effectivePitch)) * cos(glm::radians(cameraYaw));
+
+    view = glm::lookAt(cameraPos, center, glm::vec3(0,1,0));
+    projection = glm::perspective(glm::radians(80.0f), float(winWidth) / float(winHeight), 0.1f, 350.f);
+    glm::mat4 VP = projection * view;
+    glm::mat4 identity = glm::mat4(1.0f);
+    
+    updateNodeTransformations(rootNode, identity, VP);
+
+    float orthoSize = 150.0f;
+    glm::mat4 lightProjection = glm::ortho(-orthoSize, orthoSize, -orthoSize, orthoSize, 1.0f, 400.0f);
+    glm::vec3 lightUp = (fabs(sunDir.y) < 0.999f) ? glm::vec3(0.0f, 1.0f, 0.0f)
+                                                        : glm::vec3(0.0f, 0.0f, 1.0f);
+    glm::mat4 lightView = glm::lookAt(lightNode->position, glm::vec3(0, 0, 0), lightUp);
+    lightSpaceMatrix = lightProjection * lightView;
+}
+
+
+static void renderShadowScene(SceneNode *node) {
+    // ShadowMVP uses the light-space matrix, which transforms world coordinates to the light's view
+    glm::mat4 shadowMVP = lightSpaceMatrix * node->modelMatrix;
+    glUniformMatrix4fv(glGetUniformLocation(shadowShader->get(), "MVP"), 
+                       1, GL_FALSE, glm::value_ptr(shadowMVP));
+    
+    if(node->nodeType == GEOMETRY && node->vertexArrayObjectID != -1) {
+        glBindVertexArray(node->vertexArrayObjectID);
+        glDrawElements(GL_TRIANGLES, node->VAOIndexCount, GL_UNSIGNED_INT, nullptr);
+    }
+    
+    for(auto child : node->children)
+        renderShadowScene(child);
+}
+
+
+static void renderNode(SceneNode *node) {
+
+    if(node->nodeType == GEOMETRY && node->vertexArrayObjectID != -1) {
+         glBindVertexArray(node->vertexArrayObjectID);
+        
+        // Set texture uniforms for this node
+        if (node->hasTexture && node->textureID != 0) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, node->textureID);
+            glUniform1i(glGetUniformLocation(shader->get(), "diffuseTexture"), 0);
+            glUniform1i(glGetUniformLocation(shader->get(), "useTexture"), 1);
+        } else {
+            glUniform1i(glGetUniformLocation(shader->get(), "useTexture"), 0);
+        }
+        
+        // Set the matrices for the node
+        glUniformMatrix4fv(glGetUniformLocation(shader->get(), "modelMatrix"), 
+                            1, GL_FALSE, glm::value_ptr(node->modelMatrix));
+        glUniformMatrix4fv(glGetUniformLocation(shader->get(), "MVP"), 
+                            1, GL_FALSE, glm::value_ptr(node->MVP));
+        
+        glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(node->modelMatrix)));
+        glUniformMatrix3fv(glGetUniformLocation(shader->get(), "normalMatrix"), 
+                            1, GL_FALSE, glm::value_ptr(normalMatrix));
+        
+        glDrawElements(GL_TRIANGLES, node->VAOIndexCount, GL_UNSIGNED_INT, nullptr);
+    }
+    for(auto child : node->children)
+        renderNode(child);
+}
+
+
+void renderFrame(GLFWwindow *window) {
+
+    // Shadow mapping render
+    glViewport(0, 0, SHADOW_WIDTH, SHADOW_HEIGHT);
+    glBindFramebuffer(GL_FRAMEBUFFER, shadowFBO);
+    glClear(GL_DEPTH_BUFFER_BIT);
+
+    shadowShader->activate();
+
+    // Render the scene from the light's perspective. This writes depth values
+    renderShadowScene(rootNode);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // Main render
+    int winWidth, winHeight;
+    glfwGetWindowSize(window, &winWidth, &winHeight);
+    glViewport(0, 0, winWidth, winHeight);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    shader->activate();
+    // Light-space matrix used for shadow mapping calculations
+    glUniformMatrix4fv(glGetUniformLocation(shader->get(), "lightSpaceMatrix"),
+                    1, GL_FALSE, glm::value_ptr(lightSpaceMatrix));
+    glUniform3fv(glGetUniformLocation(shader->get(), "sunDir"), 1, glm::value_ptr(sunDir));
+    glUniform3fv(glGetUniformLocation(shader->get(), "sunColor"), 1, glm::value_ptr(lightNode->lightColor));
+    glUniform3fv(glGetUniformLocation(shader->get(), "cameraPos"), 1, glm::value_ptr(cameraPos));
+
+    // Bind the shadow map texture to texture unit 1.
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, shadowMap);
+    // Inform the shader that the shadow map is available on texture unit 1.
+    glUniform1i(glGetUniformLocation(shader->get(), "shadowMap"), 1);
+
+    // Render scene objects (in this case only the sundial) using their vertex data and transformations.
+    renderNode(rootNode);
+
+    // Skybox Render
+    skybox->render(view, projection, sunDir);
+
+    shader->activate();
+}
+
+
+    </scenelogic.cpp>
+    <scenelogic.h>
+        #pragma once
+
+        #include <utilities/window.hpp>
+        #include "sceneGraph.hpp"
+
+        struct LightSource {
+            glm::vec3 position;
+            glm::vec3 color;
+        };
+
+        void initScene(GLFWwindow *window, CommandLineOptions options);
+        void updateFrame(GLFWwindow *window);
+        void renderFrame(GLFWwindow *window);
+    </scenelogic.h>
+    <main.cpp>
+            // Local headers
+            #include "utilities/window.hpp"
+            #include "program.hpp"
+
+            // System headers
+            #include <glad/glad.h>
+            #include <GLFW/glfw3.h>
+
+            // Standard headers
+            #include <cstdlib>
+            #include <arrrgh.hpp>
+
+            // A callback which allows GLFW to report errors whenever they occur
+            static void glfwErrorCallback(int error, const char *description)
+            {
+                fprintf(stderr, "GLFW returned an error:\n\t%s (%i)\n", description, error);
+            }
+
+            GLFWwindow *initialise()
+            {
+                // Initialise GLFW
+                if (!glfwInit())
+                {
+                    fprintf(stderr, "Could not start GLFW\n");
+                    exit(EXIT_FAILURE);
+                }
+
+                // Set core window options (adjust version numbers if needed)
+                glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+                glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+                glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+                // Enable the GLFW runtime error callback function defined previously.
+                glfwSetErrorCallback(glfwErrorCallback);
+
+                // Set additional window options
+                glfwWindowHint(GLFW_RESIZABLE, windowResizable);
+                glfwWindowHint(GLFW_SAMPLES, windowSamples); // MSAA
+
+                // Create window using GLFW
+                GLFWwindow *window = glfwCreateWindow(windowWidth, windowHeight, windowTitle.c_str(), nullptr, nullptr);
+
+                // Ensure the window is set up correctly
+                if (!window)
+                {
+                    fprintf(stderr, "Could not open GLFW window\n");
+                    glfwTerminate();
+                    exit(EXIT_FAILURE);
+                }
+
+                // Let the window be the current OpenGL context and initialise glad
+                glfwMakeContextCurrent(window);
+                gladLoadGL();
+
+                // Print various OpenGL information to stdout
+                printf("%s: %s\n", glGetString(GL_VENDOR), glGetString(GL_RENDERER));
+                printf("GLFW\t %s\n", glfwGetVersionString());
+                printf("OpenGL\t %s\n", glGetString(GL_VERSION));
+                printf("GLSL\t %s\n\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
+
+                return window;
+            }
+
+            int main(int argc, const char *argb[])
+            {
+                arrrgh::parser parser("glowbox", "Small breakout like juggling game");
+                const auto &showHelp = parser.add<bool>("help", "Show this help message.", 'h', arrrgh::Optional, false);
+                const auto &enableMusic = parser.add<bool>("enable-music", "Play background music while the game is playing", 'm', arrrgh::Optional, false);
+                const auto &enableAutoplay = parser.add<bool>("autoplay", "Let the game play itself automatically. Useful for testing.", 'a', arrrgh::Optional, false);
+
+                // If you want to add more program arguments, define them here,
+                // but do not request their value here (they have not been parsed yet at this point).
+
+                try
+                {
+                    parser.parse(argc, argb);
+                }
+                catch (const std::exception &e)
+                {
+                    std::cerr << "Error parsing arguments: " << e.what() << std::endl;
+                    parser.show_usage(std::cerr);
+                    exit(1);
+                }
+
+                // Show help if desired
+                if (showHelp.value())
+                {
+                    return 0;
+                }
+
+                CommandLineOptions options;
+                options.enableMusic = enableMusic.value();
+                options.enableAutoplay = enableAutoplay.value();
+
+                // Initialise window using GLFW
+                GLFWwindow *window = initialise();
+
+                // Run an OpenGL application using this window
+                runProgram(window, options);
+
+                // Terminate GLFW (no need to call glfwDestroyWindow)
+                glfwTerminate();
+
+                return EXIT_SUCCESS;
+            }
+
+    </main.cpp>
+    <program.cpp>
+        // Local headers
+        #include "program.hpp"
+        #include "utilities/window.hpp"
+        #include "scenelogic.h"
+        #include <glm/glm.hpp>
+        // glm::translate, glm::rotate, glm::scale, glm::perspective
+        #include <glm/gtc/matrix_transform.hpp>
+        #include <iostream>
+        #include <SFML/Audio.hpp>
+        #include <SFML/System/Time.hpp>
+        #include <utilities/shapes.h>
+        #include <utilities/glutils.h>
+        #include <utilities/shader.hpp>
+        #include <glm/gtc/type_ptr.hpp>
+        #include <utilities/timeutils.h>
+
+        void runProgram(GLFWwindow *window, CommandLineOptions options)
+        {
+            // Enable depth (Z) buffer (accept "closest" fragment)
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LESS);
+
+            // Configure miscellaneous OpenGL settings
+            glEnable(GL_CULL_FACE);
+
+            // Disable built-in dithering
+            glDisable(GL_DITHER);
+
+            // Enable transparency
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+            // Set default colour after clearing the colour buffer
+            glClearColor(0.3f, 0.5f, 0.8f, 1.0f);
+
+            initScene(window, options);
+
+            // Rendering Loop
+            while (!glfwWindowShouldClose(window))
+            {
+                // Clear colour and depth buffers
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+                updateFrame(window);
+                renderFrame(window);
+
+                // Handle other events
+                glfwPollEvents();
+                handleKeyboardInput(window);
+
+                // Flip buffers
+                glfwSwapBuffers(window);
+            }
+        }
+
+        void handleKeyboardInput(GLFWwindow *window)
+        {
+            // Use escape key for terminating the GLFW window
+            if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+            {
+                glfwSetWindowShouldClose(window, GL_TRUE);
+            }
+        }
+
+    </program.cpp>
+    <program.hpp>
+        #ifndef PROGRAM_HPP
+        #define PROGRAM_HPP
+        #pragma once
+
+        // System headers
+        #include <GLFW/glfw3.h>
+        #include <glad/glad.h>
+        #include <string>
+        #include <utilities/window.hpp>
+
+        // Main OpenGL program
+        void runProgram(GLFWwindow *window, CommandLineOptions options);
+
+        // Function for handling keypresses
+        void handleKeyboardInput(GLFWwindow *window);
+
+        // Checks for whether an OpenGL error occurred. If one did,
+        // it prints out the error type and ID
+        inline void printGLError()
+        {
+            int errorID = glGetError();
+
+            if (errorID != GL_NO_ERROR)
+            {
+                std::string errorString;
+
+                switch (errorID)
+                {
+                case GL_INVALID_ENUM:
+                    errorString = "GL_INVALID_ENUM";
+                    break;
+                case GL_INVALID_OPERATION:
+                    errorString = "GL_INVALID_OPERATION";
+                    break;
+                case GL_INVALID_FRAMEBUFFER_OPERATION:
+                    errorString = "GL_INVALID_FRAMEBUFFER_OPERATION";
+                    break;
+                case GL_OUT_OF_MEMORY:
+                    errorString = "GL_OUT_OF_MEMORY";
+                    break;
+                case GL_STACK_UNDERFLOW:
+                    errorString = "GL_STACK_UNDERFLOW";
+                    break;
+                case GL_STACK_OVERFLOW:
+                    errorString = "GL_STACK_OVERFLOW";
+                    break;
+                default:
+                    errorString = "[Unknown error ID]";
+                    break;
+                }
+
+                fprintf(stderr, "An OpenGL error occurred (%i): %s.\n",
+                        errorID, errorString.c_str());
+            }
+        }
+
+        #endif
+
+    </program.hpp>
+    <scenegraph.cpp>
+        #include "sceneGraph.hpp"
+        #include <iostream>
+
+        SceneNode *createSceneNode()
+        {
+            return new SceneNode();
+        }
+
+        // Add a child node to its parent's list of children
+        void addChild(SceneNode *parent, SceneNode *child)
+        {
+            parent->children.push_back(child);
+        }
+
+        int totalChildren(SceneNode *parent)
+        {
+            int count = parent->children.size();
+            for (SceneNode *child : parent->children)
+            {
+                count += totalChildren(child);
+            }
+            return count;
+        }
+
+        // Pretty prints the current values of a SceneNode instance to stdout
+        void printNode(SceneNode *node)
+        {
+            printf(
+                    "SceneNode {\n"
+                    "    Child count: %i\n"
+                    "    Rotation: (%f, %f, %f)\n"
+                    "    Location: (%f, %f, %f)\n"
+                    "    Reference point: (%f, %f, %f)\n"
+                    "    VAO ID: %i\n"
+                    "}\n",
+                    int(node->children.size()),
+                    node->rotation.x, node->rotation.y, node->rotation.z,
+                    node->position.x, node->position.y, node->position.z,
+                    node->referencePoint.x, node->referencePoint.y, node->referencePoint.z,
+                    node->vertexArrayObjectID);
+        }
+
+    </scenegraph.cpp>
+    <scenegraph.hpp>
+        #pragma once
+
+        #include <glm/glm.hpp>
+        #include <glm/mat4x4.hpp>
+        #include <glm/gtc/type_ptr.hpp>
+
+        #include <stack>
+        #include <vector>
+        #include <cstdio>
+        #include <stdbool.h>
+        #include <cstdlib> 
+        #include <ctime> 
+        #include <chrono>
+        #include <fstream>
+
+        enum SceneNodeType {
+            GEOMETRY, POINT_LIGHT, SPOT_LIGHT
+        };
+
+        struct SceneNode {
+            SceneNode() {
+                position = glm::vec3(0, 0, 0);
+                rotation = glm::vec3(0, 0, 0);
+                scale = glm::vec3(1, 1, 1);
+
+                referencePoint = glm::vec3(0, 0, 0);
+                vertexArrayObjectID = -1;
+                VAOIndexCount = 0;
+
+                nodeType = GEOMETRY;
+
+            }
+
+            // A list of all children that belong to this node.
+            // For instance, in case of the scene graph of a human body shown in the assignment text, the "Upper Torso" node would contain the "Left Arm", "Right Arm", "Head" and "Lower Torso" nodes in its list of children.
+            std::vector<SceneNode*> children;
+            
+            // The node's position and rotation relative to its parent
+            glm::vec3 position;
+            glm::vec3 rotation;
+            glm::vec3 scale;
+
+            // Color of the light
+            glm::vec3 lightColor;
+
+            // A transformation matrix representing the transformation of the node's location relative to its parent. This matrix is updated every frame.
+            glm::mat4 modelMatrix;
+            glm::mat4 MVP;
+
+            // The location of the node's reference point
+            glm::vec3 referencePoint;
+
+            // The ID of the VAO containing the "appearance" of this SceneNode.
+            int vertexArrayObjectID;
+            unsigned int VAOIndexCount;
+
+            // Node type is used to determine how to handle the contents of a node
+            SceneNodeType nodeType;
+        };
+
+        SceneNode* createSceneNode();
+        void addChild(SceneNode* parent, SceneNode* child);
+        void printNode(SceneNode* node);
+        int totalChildren(SceneNode* parent);
+
+        // For more details, see SceneGraph.cpp.
+    </scenegraph.hpp>
+    <skybox.cpp>
+        #include "skybox.hpp"
+        #include <stb_image.h>
+        #include "utilities/shader.hpp"
+        #include <iostream>
+        #include <glm/gtc/type_ptr.hpp>
+
+        namespace Gloom {
+
+        // Vertex data for a cube that will be used to draw the skybox.
+        float skyboxVertices[] = {
+            // positions          
+            -1.0f,  1.0f, -1.0f,
+            -1.0f, -1.0f, -1.0f,
+            1.0f, -1.0f, -1.0f,  
+            1.0f, -1.0f, -1.0f,
+            1.0f,  1.0f, -1.0f,
+            -1.0f,  1.0f, -1.0f,
+                    
+            -1.0f, -1.0f,  1.0f,
+            -1.0f, -1.0f, -1.0f,
+            -1.0f,  1.0f, -1.0f,
+            -1.0f,  1.0f, -1.0f,
+            -1.0f,  1.0f,  1.0f,
+            -1.0f, -1.0f,  1.0f,
+                    
+            1.0f, -1.0f, -1.0f,
+            1.0f, -1.0f,  1.0f,
+            1.0f,  1.0f,  1.0f,
+            1.0f,  1.0f,  1.0f,
+            1.0f,  1.0f, -1.0f,
+            1.0f, -1.0f, -1.0f,
+                    
+            -1.0f, -1.0f,  1.0f,
+            -1.0f,  1.0f,  1.0f,
+            1.0f,  1.0f,  1.0f,
+            1.0f,  1.0f,  1.0f,
+            1.0f, -1.0f,  1.0f,
+            -1.0f, -1.0f,  1.0f,
+                    
+            -1.0f,  1.0f, -1.0f,
+            1.0f,  1.0f, -1.0f,
+            1.0f,  1.0f,  1.0f,
+            1.0f,  1.0f,  1.0f,
+            -1.0f,  1.0f,  1.0f,
+            -1.0f,  1.0f, -1.0f,
+                    
+            -1.0f, -1.0f, -1.0f,
+            -1.0f, -1.0f,  1.0f,
+            1.0f, -1.0f, -1.0f,
+            1.0f, -1.0f, -1.0f,
+            -1.0f, -1.0f,  1.0f,
+            1.0f, -1.0f,  1.0f
+        };
+
+        static unsigned int loadCubemap(const std::vector<std::string>& faces)
+        {
+            unsigned int textureID;
+            glGenTextures(1, &textureID);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, textureID);
+
+            int width, height, nrChannels;
+            for (unsigned int i = 0; i < faces.size(); i++)
+            {
+                unsigned char *data = stbi_load(faces[i].c_str(), &width, &height, &nrChannels, 0);
+                if (data)
+                {
+                    GLenum format = (nrChannels == 4) ? GL_RGBA : GL_RGB;
+                    glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, format, width, height,
+                                0, format, GL_UNSIGNED_BYTE, data);
+                    stbi_image_free(data);
+                }
+                else
+                {
+                    std::cout << "Cubemap texture failed to load at path: " << faces[i] << std::endl;
+                    stbi_image_free(data);
+                }
+            }
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+
+            return textureID;
+        }
+
+        Skybox::Skybox() : cubemapTexture(0), VAO(0), VBO(0), shader(nullptr) {}
+
+        Skybox::~Skybox()
+        {
+            if(shader) {
+                shader->destroy();
+                delete shader;
+            }
+            glDeleteVertexArrays(1, &VAO);
+            glDeleteBuffers(1, &VBO);
+        }
+
+        void Skybox::init(const std::vector<std::string>& faces,
+                        const std::string& shaderVertPath,
+                        const std::string& shaderFragPath)
+        {
+            // Load the cubemap texture.
+            cubemapTexture = loadCubemap(faces);
+
+            // Set up the VAO and VBO for the skybox cube.
+            glGenVertexArrays(1, &VAO);
+            glGenBuffers(1, &VBO);
+            glBindVertexArray(VAO);
+            glBindBuffer(GL_ARRAY_BUFFER, VBO);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(skyboxVertices), skyboxVertices, GL_STATIC_DRAW);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+            glBindVertexArray(0);
+
+            // Create and compile the skybox shader.
+            shader = new Shader();
+            shader->makeBasicShader(shaderVertPath, shaderFragPath);
+        }
+
+        void Skybox::render(const glm::mat4& view, const glm::mat4& projection)
+        {
+            // Change depth function so that skybox fragments are drawn where no geometry exists.
+            glDepthFunc(GL_LEQUAL);
+            shader->activate();
+
+            // Remove translation from the view matrix.
+            glm::mat4 viewNoTranslation = glm::mat4(glm::mat3(view));
+            glUniformMatrix4fv(glGetUniformLocation(shader->get(), "view"), 1, GL_FALSE, glm::value_ptr(viewNoTranslation));
+            glUniformMatrix4fv(glGetUniformLocation(shader->get(), "projection"), 1, GL_FALSE, glm::value_ptr(projection));
+
+            glBindVertexArray(VAO);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, cubemapTexture);
+            glUniform1i(glGetUniformLocation(shader->get(), "skybox"), 0);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+            glBindVertexArray(0);
+
+            shader->deactivate();
+            glDepthFunc(GL_LESS);
+        }
+
+        } // namespace Gloom
+
+    </skybox.cpp>
+    <skybox.hpp>
+        #ifndef SKYBOX_HPP
+        #define SKYBOX_HPP
+
+        #include <vector>
+        #include <string>
+        #include <glad/glad.h>
+        #include <glm/glm.hpp>
+
+        namespace Gloom {
+
+            class Shader; // Forward declaration from your shader.hpp
+
+            class Skybox {
+            public:
+                Skybox();
+                ~Skybox();
+
+                // Initializes the cubemap from 6 faces and loads the skybox shaders.
+                // 'faces' should contain the file paths to the cubemap images in the following order:
+                // Right, Left, Top, Bottom, Front, Back.
+                void init(const std::vector<std::string>& faces,
+                        const std::string& shaderVertPath,
+                        const std::string& shaderFragPath);
+
+                // Renders the skybox.
+                // The view matrix should have the translation removed (this is done internally).
+                void render(const glm::mat4& view, const glm::mat4& projection);
+
+            private:
+                unsigned int cubemapTexture;
+                unsigned int VAO, VBO;
+                Shader* shader;
+            };
+
+        }
+
+        #endif
+
+    </skybox.hpp>
+    <utilities>
+        <camera.hpp>
+            #ifndef CAMERA_HPP
+            #define CAMERA_HPP
+            #pragma once
+
+            // System headers
+            #include <glad/glad.h>
+            #include <glm/glm.hpp>
+            #include <glm/gtc/matrix_transform.hpp>
+            #include <glm/gtc/quaternion.hpp>
+            #include <GLFW/glfw3.h>
+
+
+            namespace Gloom
+            {
+                class Camera
+                {
+                public:
+                    Camera(glm::vec3 position         = glm::vec3(0.0f, 0.0f, 2.0f),
+                        GLfloat   movementSpeed    = 5.0f,
+                        GLfloat   mouseSensitivity = 0.005f)
+                    {
+                        cPosition         = position;
+                        cMovementSpeed    = movementSpeed;
+                        cMouseSensitivity = mouseSensitivity;
+
+                        // Set up the initial view matrix
+                        updateViewMatrix();
+                    }
+
+                    // Public member functions
+
+                    /* Getter for the view matrix */
+                    glm::mat4 getViewMatrix() { return matView; }
+
+
+                    /* Handle keyboard inputs from a callback mechanism */
+                    void handleKeyboardInputs(int key, int action)
+                    {
+                        // Keep track of pressed/released buttons
+                        if (key >= 0 && key < 512)
+                        {
+                            if (action == GLFW_PRESS)
+                            {
+                                keysInUse[key] = true;
+                            }
+                            else if (action == GLFW_RELEASE)
+                            {
+                                keysInUse[key] = false;
+                            }
+                        }
+                    }
+
+
+                    /* Handle mouse button inputs from a callback mechanism */
+                    void handleMouseButtonInputs(int button, int action)
+                    {
+                        // Ensure that the camera only rotates when the left mouse button is
+                        // pressed
+                        if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS)
+                        {
+                            isMousePressed = true;
+                        }
+                        else
+                        {
+                            isMousePressed = false;
+                            resetMouse = true;
+                        }
+                    }
+
+
+                    /* Handle cursor position from a callback mechanism */
+                    void handleCursorPosInput(double xpos, double ypos)
+                    {
+                        // Do nothing if the left mouse button is not pressed
+                        if (isMousePressed == false)
+                            return;
+
+                        // There should be no movement when the mouse button is released
+                        if (resetMouse)
+                        {
+                            lastXPos = xpos;
+                            lastYPos = ypos;
+                            resetMouse = false;
+                        }
+
+                        // Keep track of pitch and yaw for the current frame
+                        fYaw   = xpos - lastXPos;
+                        fPitch = ypos - lastYPos;
+
+                        // Update last known cursor position
+                        lastXPos = xpos;
+                        lastYPos = ypos;
+                    }
+
+
+                    /* Update the camera position and view matrix
+                    `deltaTime` is the time between the current and last frame */
+                    void updateCamera(GLfloat deltaTime)
+                    {
+                        // Extract movement information from the view matrix
+                        glm::vec3 dirX(matView[0][0], matView[1][0], matView[2][0]);
+                        glm::vec3 dirY(matView[0][1], matView[1][1], matView[2][1]);
+                        glm::vec3 dirZ(matView[0][2], matView[1][2], matView[2][2]);
+
+                        // Alter position in the appropriate direction
+                        glm::vec3 fMovement(0.0f, 0.0f, 0.0f);
+
+                        if (keysInUse[GLFW_KEY_W])  // forward
+                            fMovement -= dirZ;
+
+                        if (keysInUse[GLFW_KEY_S])  // backward
+                            fMovement += dirZ;
+
+                        if (keysInUse[GLFW_KEY_A])  // left
+                            fMovement -= dirX;
+
+                        if (keysInUse[GLFW_KEY_D])  // right
+                            fMovement += dirX;
+
+                        if (keysInUse[GLFW_KEY_E])  // vertical up
+                            fMovement += dirY;
+
+                        if (keysInUse[GLFW_KEY_Q])  // vertical down
+                            fMovement -= dirY;
+
+                        // Trick to balance PC speed with movement
+                        GLfloat velocity = cMovementSpeed * deltaTime;
+
+                        // Update camera position using the appropriate velocity
+                        cPosition += fMovement * velocity;
+
+                        // Update the view matrix based on the new information
+                        updateViewMatrix();
+                    }
+
+                private:
+                    // Disable copying and assignment
+                    Camera(Camera const &) = delete;
+                    Camera & operator =(Camera const &) = delete;
+
+                    // Private member function
+
+                    /* Update the view matrix based on the current information */
+                    void updateViewMatrix()
+                    {
+                        // Adjust cursor movement using the specified sensitivity
+                        fPitch *= cMouseSensitivity;
+                        fYaw   *= cMouseSensitivity;
+
+                        // Create quaternions given the current pitch and yaw
+                        glm::quat qPitch = glm::quat(glm::vec3(fPitch, 0.0f, 0.0f));
+                        glm::quat qYaw   = glm::quat(glm::vec3(0.0f, fYaw, 0.0f));
+
+                        // Reset pitch and yaw values for the current rotation
+                        fPitch = 0.0f;
+                        fYaw   = 0.0f;
+
+                        // Update camera quaternion and normalise
+                        cQuaternion = qYaw * qPitch * cQuaternion;
+                        cQuaternion = glm::normalize(cQuaternion);
+
+                        // Build rotation matrix using the camera quaternion
+                        glm::mat4 matRotation = glm::mat4_cast(cQuaternion);
+
+                        // Build translation matrix
+                        glm::mat4 matTranslate = glm::translate(glm::mat4(1.0f), -cPosition);
+
+                        // Update view matrix
+                        matView = matRotation * matTranslate;
+                    }
+
+                    // Private member variables
+
+                    // Camera quaternion and frame pitch and yaw
+                    glm::quat cQuaternion;
+                    GLfloat fPitch = 0.0f;
+                    GLfloat fYaw   = 0.0f;
+
+                    // Camera position
+                    glm::vec3 cPosition;
+
+                    // Variables used for bookkeeping
+                    GLboolean resetMouse     = true;
+                    GLboolean isMousePressed = false;
+                    GLboolean keysInUse[512];
+
+                    // Last cursor position
+                    GLfloat lastXPos = 0.0f;
+                    GLfloat lastYPos = 0.0f;
+
+                    // Camera settings
+                    GLfloat cMovementSpeed;
+                    GLfloat cMouseSensitivity;
+
+                    // View matrix
+                    glm::mat4 matView;
+                };
+            }
+
+            #endif
+
+        </camera.hpp>
+        <glfont.cpp>
+            #include <iostream>
+            #include "glfont.h"
+
+            Mesh generateTextGeometryBuffer(std::string text, float characterHeightOverWidth, float totalTextWidth) {
+                float characterWidth = totalTextWidth / float(text.length());
+                float characterHeight = characterHeightOverWidth * characterWidth;
+
+                unsigned int vertexCount = 4 * text.length();
+                unsigned int indexCount = 6 * text.length();
+
+                Mesh mesh;
+
+                mesh.vertices.resize(vertexCount);
+                mesh.indices.resize(indexCount);
+
+                for(unsigned int i = 0; i < text.length(); i++)
+                {
+                    float baseXCoordinate = float(i) * characterWidth;
+
+                    mesh.vertices.at(4 * i + 0) = {baseXCoordinate, 0, 0};
+                    mesh.vertices.at(4 * i + 1) = {baseXCoordinate + characterWidth, 0, 0};
+                    mesh.vertices.at(4 * i + 2) = {baseXCoordinate + characterWidth, characterHeight, 0};
+
+                    mesh.vertices.at(4 * i + 0) = {baseXCoordinate, 0, 0};
+                    mesh.vertices.at(4 * i + 2) = {baseXCoordinate + characterWidth, characterHeight, 0};
+                    mesh.vertices.at(4 * i + 3) = {baseXCoordinate, characterHeight, 0};
+
+
+                    mesh.indices.at(6 * i + 0) = 4 * i + 0;
+                    mesh.indices.at(6 * i + 1) = 4 * i + 1;
+                    mesh.indices.at(6 * i + 2) = 4 * i + 2;
+                    mesh.indices.at(6 * i + 3) = 4 * i + 0;
+                    mesh.indices.at(6 * i + 4) = 4 * i + 2;
+                    mesh.indices.at(6 * i + 5) = 4 * i + 3;
+                }
+
+                return mesh;
+            }
+        </glfont.cpp>
+        <glfont.h>
+            #pragma once
+
+            #include <string>
+            #include "mesh.h"
+
+            Mesh generateTextGeometryBuffer(std::string text, float characterHeightOverWidth, float totalTextWidth);
+        </glfont.h>
+        <glutils.cpp>
+            #include <glad/glad.h>
+            #include <program.hpp>
+            #include "glutils.h"
+            #include <vector>
+
+            template <class T>
+            unsigned int generateAttribute(int id, int elementsPerEntry, std::vector<T> data, bool normalize) {
+                unsigned int bufferID;
+                glGenBuffers(1, &bufferID);
+                glBindBuffer(GL_ARRAY_BUFFER, bufferID);
+                glBufferData(GL_ARRAY_BUFFER, data.size() * sizeof(T), data.data(), GL_STATIC_DRAW);
+                glVertexAttribPointer(id, elementsPerEntry, GL_FLOAT, normalize ? GL_TRUE : GL_FALSE, sizeof(T), 0);
+                glEnableVertexAttribArray(id);
+                return bufferID;
+            }
+
+            unsigned int generateBuffer(Mesh &mesh) {
+                unsigned int vaoID;
+                glGenVertexArrays(1, &vaoID);
+                glBindVertexArray(vaoID);
+
+                generateAttribute(0, 3, mesh.vertices, false);
+                if (mesh.normals.size() > 0) {
+                    generateAttribute(1, 3, mesh.normals, true);
+                }
+                if (mesh.textureCoordinates.size() > 0) {
+                    generateAttribute(2, 2, mesh.textureCoordinates, false);
+                }
+
+                unsigned int indexBufferID;
+                glGenBuffers(1, &indexBufferID);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBufferID);
+                glBufferData(GL_ELEMENT_ARRAY_BUFFER, mesh.indices.size() * sizeof(unsigned int), mesh.indices.data(), GL_STATIC_DRAW);
+
+                return vaoID;
+            }
+
+        </glutils.cpp>
+        <glutils.h>
+            #pragma once
+
+            #include "mesh.h"
+
+            unsigned int generateBuffer(Mesh &mesh);
+        </glutils.h>
+        <imageLoader.cpp>
+            #include "imageLoader.hpp"
+            #include <iostream>
+
+            // Original source: https://raw.githubusercontent.com/lvandeve/lodepng/master/examples/example_decode.cpp
+            PNGImage loadPNGFile(std::string fileName)
+            {
+                std::vector<unsigned char> png;
+                std::vector<unsigned char> pixels; //the raw pixels
+                unsigned int width, height;
+
+                //load and decode
+                unsigned error = lodepng::load_file(png, fileName);
+                if(!error) error = lodepng::decode(pixels, width, height, png);
+
+                //if there's an error, display it
+                if(error) std::cout << "decoder error " << error << ": " << lodepng_error_text(error) << std::endl;
+
+                //the pixels are now in the vector "image", 4 bytes per pixel, ordered RGBARGBA..., use it as texture, draw it, ...
+
+                // Unfortunately, images usually have their origin at the top left.
+                // OpenGL instead defines the origin to be on the _bottom_ left instead, so
+                // here's the world's most inefficient way to flip the image vertically.
+
+                // You're welcome :)
+
+                unsigned int widthBytes = 4 * width;
+
+                for(unsigned int row = 0; row < (height / 2); row++) {
+                    for(unsigned int col = 0; col < widthBytes; col++) {
+                        std::swap(pixels[row * widthBytes + col], pixels[(height - 1 - row) * widthBytes + col]);
+                    }
+                }
+
+                PNGImage image;
+                image.width = width;
+                image.height = height;
+                image.pixels = pixels;
+
+                return image;
+
+            }
+        </imageLoader.cpp>
+        <imageLoader.hpp>
+            #pragma once
+
+            #include "lodepng.h"
+            #include <vector>
+            #include <string>
+
+            typedef struct PNGImage {
+                unsigned int width;
+                unsigned int height;
+                std::vector<unsigned char> pixels;
+            } PNGImage;
+
+            PNGImage loadPNGFile(std::string fileName);
+
+        </imageLoader.hpp>
+        <textureLoader.cpp>
+            // textureLoader.cpp
+            #define STB_IMAGE_IMPLEMENTATION
+            #include "stb_image.h"
+            #include "textureLoader.hpp"
+            #include <glad/glad.h>
+            #include <iostream>
+
+            unsigned int loadTexture(const std::string &filename) {
+                int width, height, nrChannels;
+                // stb_image can load JPEG, PNG, etc.
+                unsigned char *data = stbi_load(filename.c_str(), &width, &height, &nrChannels, 0);
+                if (!data) {
+                    std::cerr << "Failed to load texture: " << filename << std::endl;
+                    return 0;
+                }
+                
+                GLenum format;
+                if (nrChannels == 1)
+                    format = GL_RED;
+                else if (nrChannels == 3)
+                    format = GL_RGB;
+                else if (nrChannels == 4)
+                    format = GL_RGBA;
+                else
+                    format = GL_RGB;
+                    
+                unsigned int textureID;
+                glGenTextures(1, &textureID);
+                glBindTexture(GL_TEXTURE_2D, textureID);
+                
+                glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
+                glGenerateMipmap(GL_TEXTURE_2D);
+                
+                // Set texture wrapping/filtering options.
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);	
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                
+                stbi_image_free(data);
+                return textureID;
+            }
+        </textureLoader.cpp>
+        <textureLoader.hpp>
+            #pragma once
+            #include <string>
+            unsigned int loadTexture(const std::string &filename);
+        </textureLoader.hpp>
+        <mesh.h>
+            #pragma once
+
+            #include <vector>
+            #include <glm/glm.hpp>
+
+            struct Mesh {
+                std::vector<glm::vec3> vertices;
+                std::vector<glm::vec3> normals;
+                std::vector<glm::vec2> textureCoordinates;
+
+                std::vector<unsigned int> indices;
+            };
+        </mesh.h>
+        <shader.hpp>
+            #ifndef SHADER_HPP
+            #define SHADER_HPP
+            #pragma once
+
+            // System headers
+            #include <glad/glad.h>
+
+            // Standard headers
+            #include <cassert>
+            #include <fstream>
+            #include <memory>
+            #include <string>
+
+
+            namespace Gloom
+            {
+                class Shader
+                {
+                private:
+
+                    // Private member variables
+                    GLuint mProgram;
+                    GLint  mStatus;
+                    GLint  mLength;
+
+                public:
+                    Shader() {
+                        mProgram = glCreateProgram();
+                    }
+
+                    // Public member functions
+                    void   activate()   { glUseProgram(mProgram); }
+                    void   deactivate() { glUseProgram(0); }
+                    GLuint get()        { return mProgram; }
+                    void   destroy()    { glDeleteProgram(mProgram); }
+
+                    /* Attach a shader to the current shader program */
+                    void attach(std::string const &filename)
+                    {
+                        // Load GLSL Shader from source
+                        std::ifstream fd(filename.c_str());
+                        if (fd.fail())
+                        {
+                            fprintf(stderr,
+                                "Something went wrong when attaching the Shader file at \"%s\".\n"
+                                "The file may not exist or is currently inaccessible.\n",
+                                filename.c_str());
+                            return;
+                        }
+                        auto src = std::string(std::istreambuf_iterator<char>(fd),
+                                            (std::istreambuf_iterator<char>()));
+
+                        // Create shader object
+                        const char * source = src.c_str();
+                        auto shader = create(filename);
+                        glShaderSource(shader, 1, &source, nullptr);
+                        glCompileShader(shader);
+
+                        // Display errors
+                        glGetShaderiv(shader, GL_COMPILE_STATUS, &mStatus);
+                        if (!mStatus)
+                        {
+                            glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &mLength);
+                            std::unique_ptr<char[]> buffer(new char[mLength]);
+                            glGetShaderInfoLog(shader, mLength, nullptr, buffer.get());
+                            fprintf(stderr, "%s\n%s", filename.c_str(), buffer.get());
+                        }
+
+                        assert(mStatus);
+
+                        // Attach shader and free allocated memory
+                        glAttachShader(mProgram, shader);
+                        glDeleteShader(shader);
+                    }
+
+
+                    /* Links all attached shaders together into a shader program */
+                    void link()
+                    {
+                        // Link all attached shaders
+                        glLinkProgram(mProgram);
+
+                        // Display errors
+                        glGetProgramiv(mProgram, GL_LINK_STATUS, &mStatus);
+                        if (!mStatus)
+                        {
+                            glGetProgramiv(mProgram, GL_INFO_LOG_LENGTH, &mLength);
+                            std::unique_ptr<char[]> buffer(new char[mLength]);
+                            glGetProgramInfoLog(mProgram, mLength, nullptr, buffer.get());
+                            fprintf(stderr, "%s\n", buffer.get());
+                        }
+
+                        assert(mStatus);
+                    }
+
+
+                    /* Convenience function that attaches and links a vertex and a
+                    fragment shader in a shader program */
+                    void makeBasicShader(std::string const &vertexFilename,
+                                        std::string const &fragmentFilename)
+                    {
+                        attach(vertexFilename);
+                        attach(fragmentFilename);
+                        link();
+                    }
+
+                    /* Convenience function to get a uniforms ID from a string
+                    containing its name */
+                    GLint getUniformFromName(std::string const &uniformName) {
+                        return glGetUniformLocation(this->get(), uniformName.c_str());
+                    }
+
+
+                    /* Used for debugging shader programs (expensive to run) */
+                    bool isValid()
+                    {
+                        // Validate linked shader program
+                        glValidateProgram(mProgram);
+
+                        // Display errors
+                        glGetProgramiv(mProgram, GL_VALIDATE_STATUS, &mStatus);
+                        if (!mStatus)
+                        {
+                            glGetProgramiv(mProgram, GL_INFO_LOG_LENGTH, &mLength);
+                            std::unique_ptr<char[]> buffer(new char[mLength]);
+                            glGetProgramInfoLog(mProgram, mLength, nullptr, buffer.get());
+                            fprintf(stderr, "%s\n", buffer.get());
+                            return false;
+                        }
+                        return true;
+                    }
+
+
+                    /* Helper function for creating shaders */
+                    GLuint create(std::string const &filename)
+                    {
+                        // Extract file extension and create the correct shader type
+                        auto idx = filename.rfind(".");
+                        auto ext = filename.substr(idx + 1);
+                            if (ext == "comp") return glCreateShader(GL_COMPUTE_SHADER);
+                        else if (ext == "frag") return glCreateShader(GL_FRAGMENT_SHADER);
+                        else if (ext == "geom") return glCreateShader(GL_GEOMETRY_SHADER);
+                        else if (ext == "tcs")  return glCreateShader(GL_TESS_CONTROL_SHADER);
+                        else if (ext == "tes")  return glCreateShader(GL_TESS_EVALUATION_SHADER);
+                        else if (ext == "vert") return glCreateShader(GL_VERTEX_SHADER);
+                        else                    return false;
+                    }
+
+                private:
+                    // Disable copying and assignment
+                    Shader(Shader const &) = delete;
+                    Shader & operator =(Shader const &) = delete;
+
+                };
+            }
+
+            #endif
+
+        </shader.hpp>
+        <shapes.cpp>
+            #include <iostream>
+            #include "shapes.h"
+
+            #ifndef M_PI
+            #define M_PI 3.14159265359f
+            #endif
+
+            Mesh cube(glm::vec3 scale, glm::vec2 textureScale, bool tilingTextures, bool inverted, glm::vec3 textureScale3d) {
+                glm::vec3 points[8];
+                int indices[36];
+
+                for (int y = 0; y <= 1; y++)
+                for (int z = 0; z <= 1; z++)
+                for (int x = 0; x <= 1; x++) {
+                    points[x+y*4+z*2] = glm::vec3(x*2-1, y*2-1, z*2-1) * 0.5f * scale;
+                }
+
+                int faces[6][4] = {
+                    {2,3,0,1}, // Bottom 
+                    {4,5,6,7}, // Top 
+                    {7,5,3,1}, // Right 
+                    {4,6,0,2}, // Left 
+                    {5,4,1,0}, // Back 
+                    {6,7,2,3}, // Front 
+                };
+
+                scale = scale * textureScale3d;
+                glm::vec2 faceScale[6] = {
+                    {-scale.x,-scale.z}, // Bottom
+                    {-scale.x,-scale.z}, // Top
+                    { scale.z, scale.y}, // Right
+                    { scale.z, scale.y}, // Left
+                    { scale.x, scale.y}, // Back
+                    { scale.x, scale.y}, // Front
+                }; 
+
+                glm::vec3 normals[6] = {
+                    { 0,-1, 0}, // Bottom 
+                    { 0, 1, 0}, // Top 
+                    { 1, 0, 0}, // Right 
+                    {-1, 0, 0}, // Left 
+                    { 0, 0,-1}, // Back 
+                    { 0, 0, 1}, // Front 
+                };
+
+                glm::vec2 UVs[4] = {
+                    {0, 0},
+                    {0, 1},
+                    {1, 0},
+                    {1, 1},
+                };
+
+                Mesh m;
+                for (int face = 0; face < 6; face++) {
+                    int offset = face * 6;
+                    indices[offset + 0] = faces[face][0];
+                    indices[offset + 3] = faces[face][0];
+
+                    if (!inverted) {
+                        indices[offset + 1] = faces[face][3];
+                        indices[offset + 2] = faces[face][1];
+                        indices[offset + 4] = faces[face][2];
+                        indices[offset + 5] = faces[face][3];
+                    } else {
+                        indices[offset + 1] = faces[face][1];
+                        indices[offset + 2] = faces[face][3];
+                        indices[offset + 4] = faces[face][3];
+                        indices[offset + 5] = faces[face][2];
+                    }
+
+                    for (int i = 0; i < 6; i++) {
+                        m.vertices.push_back(points[indices[offset + i]]);
+                        m.indices.push_back(offset + i);
+                        m.normals.push_back(normals[face] * (inverted ? -1.f : 1.f));
+                    }
+
+                    glm::vec2 textureScaleFactor = tilingTextures ? (faceScale[face] / textureScale) : glm::vec2(1);
+
+                    if (!inverted) {
+                        for (int i : {1,2,3,1,0,2}) {
+                            m.textureCoordinates.push_back(UVs[i] * textureScaleFactor);
+                        }
+                    } else {
+                        for (int i : {3,1,0,3,0,2}) {
+                            m.textureCoordinates.push_back(UVs[i] * textureScaleFactor);
+                        }
+                    }
+                }
+
+                return m;
+            }
+
+            Mesh generateSphere(float sphereRadius, int slices, int layers) {
+                const unsigned int triangleCount = slices * layers * 2;
+
+                std::vector<glm::vec3> vertices;
+                std::vector<glm::vec3> normals;
+                std::vector<unsigned int> indices;
+                std::vector<glm::vec2> uvs;
+
+                vertices.reserve(3 * triangleCount);
+                normals.reserve(3 * triangleCount);
+                indices.reserve(3 * triangleCount);
+
+                // Slices require us to define a full revolution worth of triangles.
+                // Layers only requires angle varying between the bottom and the top (a layer only covers half a circle worth of angles)
+                const float degreesPerLayer = 180.0 / (float) layers;
+                const float degreesPerSlice = 360.0 / (float) slices;
+
+                unsigned int i = 0;
+
+                // Constructing the sphere one layer at a time
+                for (int layer = 0; layer < layers; layer++) {
+                    int nextLayer = layer + 1;
+
+                    // Angles between the vector pointing to any point on a particular layer and the negative z-axis
+                    float currentAngleZDegrees = degreesPerLayer * layer;
+                    float nextAngleZDegrees = degreesPerLayer * nextLayer;
+
+                    // All coordinates within a single layer share z-coordinates.
+                    // So we can calculate those of the current and subsequent layer here.
+                    float currentZ = -cos(glm::radians(currentAngleZDegrees));
+                    float nextZ = -cos(glm::radians(nextAngleZDegrees));
+
+                    // The row of vertices forms a circle around the vertical diagonal (z-axis) of the sphere.
+                    // These radii are also constant for an entire layer, so we can precalculate them.
+                    float radius = sin(glm::radians(currentAngleZDegrees));
+                    float nextRadius = sin(glm::radians(nextAngleZDegrees));
+
+                    // Now we can move on to constructing individual slices within a layer
+                    for (int slice = 0; slice < slices; slice++) {
+
+                        // The direction of the start and the end of the slice in the xy-plane
+                        float currentSliceAngleDegrees = slice * degreesPerSlice;
+                        float nextSliceAngleDegrees = (slice + 1) * degreesPerSlice;
+
+                        // Determining the direction vector for both the start and end of the slice
+                        float currentDirectionX = cos(glm::radians(currentSliceAngleDegrees));
+                        float currentDirectionY = sin(glm::radians(currentSliceAngleDegrees));
+
+                        float nextDirectionX = cos(glm::radians(nextSliceAngleDegrees));
+                        float nextDirectionY = sin(glm::radians(nextSliceAngleDegrees));
+
+                        vertices.emplace_back(sphereRadius * radius * currentDirectionX,
+                                            sphereRadius * radius * currentDirectionY,
+                                            sphereRadius * currentZ);
+                        vertices.emplace_back(sphereRadius * radius * nextDirectionX,
+                                            sphereRadius * radius * nextDirectionY,
+                                            sphereRadius * currentZ);
+                        vertices.emplace_back(sphereRadius * nextRadius * nextDirectionX,
+                                            sphereRadius * nextRadius * nextDirectionY,
+                                            sphereRadius * nextZ);
+                        vertices.emplace_back(sphereRadius * radius * currentDirectionX,
+                                            sphereRadius * radius * currentDirectionY,
+                                            sphereRadius * currentZ);
+                        vertices.emplace_back(sphereRadius * nextRadius * nextDirectionX,
+                                            sphereRadius * nextRadius * nextDirectionY,
+                                            sphereRadius * nextZ);
+                        vertices.emplace_back(sphereRadius * nextRadius * currentDirectionX,
+                                            sphereRadius * nextRadius * currentDirectionY,
+                                            sphereRadius * nextZ);
+
+                        normals.emplace_back(radius * currentDirectionX,
+                                            radius * currentDirectionY,
+                                            currentZ);
+                        normals.emplace_back(radius * nextDirectionX,
+                                            radius * nextDirectionY,
+                                            currentZ);
+                        normals.emplace_back(nextRadius * nextDirectionX,
+                                            nextRadius * nextDirectionY,
+                                            nextZ);
+                        normals.emplace_back(radius * currentDirectionX,
+                                            radius * currentDirectionY,
+                                            currentZ);
+                        normals.emplace_back(nextRadius * nextDirectionX,
+                                            nextRadius * nextDirectionY,
+                                            nextZ);
+                        normals.emplace_back(nextRadius * currentDirectionX,
+                                            nextRadius * currentDirectionY,
+                                            nextZ);
+
+                        indices.emplace_back(i + 0);
+                        indices.emplace_back(i + 1);
+                        indices.emplace_back(i + 2);
+                        indices.emplace_back(i + 3);
+                        indices.emplace_back(i + 4);
+                        indices.emplace_back(i + 5);
+
+                        for (int j = 0; j < 6; j++) {
+                            glm::vec3 vertex = vertices.at(i+j);
+                            uvs.emplace_back(
+                                0.5 + (glm::atan(vertex.z, vertex.y)/(2.0*M_PI)),
+                                0.5 - (glm::asin(vertex.y)/M_PI)
+                            );
+                        }
+
+                        i += 6;
+                    }
+                }
+
+                Mesh mesh;
+                mesh.vertices = vertices;
+                mesh.normals = normals;
+                mesh.indices = indices;
+                mesh.textureCoordinates = uvs;
+                return mesh;
+            }
+
+        </shapes.cpp>
+        <shapes.h>
+            #pragma once
+            #include "mesh.h"
+
+            Mesh cube(glm::vec3 scale = glm::vec3(1), glm::vec2 textureScale = glm::vec2(1), bool tilingTextures = false, bool inverted = false, glm::vec3 textureScale3d = glm::vec3(1));
+            Mesh generateBox(float width, float height, float depth, bool flipFaces = false);
+            Mesh generateSphere(float radius, int slices, int layers);
+        </shapes.h>
+        <timeutils.cpp>
+            #include <chrono>
+            #include "timeutils.h"
+
+            // In order to be able to calculate when the getTimeDeltaSeconds() function was last called, we need to know the point in time when that happened. This requires us to keep hold of that point in time.
+            // We initialise this value to the time at the start of the program.
+            static std::chrono::steady_clock::time_point _previousTimePoint = std::chrono::steady_clock::now();
+
+            // Calculates the elapsed time since the previous time this function was called.
+            double getTimeDeltaSeconds() {
+                // Determine the current time
+                std::chrono::steady_clock::time_point currentTime = std::chrono::steady_clock::now();
+
+                // Calculate the number of nanoseconds that elapsed since the previous call to this function
+                long long timeDelta = std::chrono::duration_cast<std::chrono::nanoseconds>(currentTime - _previousTimePoint).count();
+                // Convert the time delta in nanoseconds to seconds
+                double timeDeltaSeconds = (double)timeDelta / 1000000000.0;
+
+                // Store the previously measured current time
+                _previousTimePoint = currentTime;
+
+                // Return the calculated time delta in seconds
+                return timeDeltaSeconds;
+            }
+        </timeutils.cpp>
+        <timeutils.h>
+            #pragma once
+
+            double getTimeDeltaSeconds();
+        </timeutils.h>
+        <window.hpp>
+            #pragma once
+
+            // System Headers
+            #include <glad/glad.h>
+
+            // Standard headers
+            #include <string>
+
+            // Constants
+            const int         windowWidth     = 1366;
+            const int         windowHeight    = 768;
+            const std::string windowTitle     = "Glowbox";
+            const GLint       windowResizable = GL_FALSE;
+            const int         windowSamples   = 4;
+
+            struct CommandLineOptions {
+                bool enableMusic;
+                bool enableAutoplay;
+            };
+        </window.hpp>
+    </utilities>
+</src>
+    <res>
+        <shaders>
+            <main.frag>
+                #version 430 core
+
+                in vec3 normal_out;
+                in vec2 textureCoordinates;
+                in vec3 fragPos;
+
+                uniform vec3 sunDir;
+                uniform vec3 sunColor;
+                uniform vec3 cameraPos;
+
+                uniform sampler2D diffuseTexture;
+                uniform bool useTexture;
+                uniform sampler2D shadowMap;
+                uniform mat4 lightSpaceMatrix;
+
+                out vec4 color;
+
+                void main()
+                {
+                    // Normalize the interpolated normal
+                    vec3 normal = normalize(normal_out);
+                    
+                    // Set up basic material parameters
+                    vec3 ambient = vec3(0.2);
+                    float shininess = 32.0;
+
+                    // Diffuse component (Lambertian)
+                    float diff = max(dot(normal, sunDir), 0.0);
+                    vec3 diffuse = sunColor * diff;
+
+                    // Specular component (Phong reflection)
+                    vec3 viewDir = normalize(cameraPos - fragPos);
+                    vec3 reflectDir = reflect(-sunDir, normal);
+                    float spec = 0.0;
+                    if (diff > 0.0)
+                    {
+                        spec = pow(max(dot(viewDir, reflectDir), 0.0), shininess);
+                    }
+                    vec3 specular = sunColor * spec;
+
+                    // Shadow mapping:
+                    // Transform fragment position into light space.
+                    vec4 fragPosLightSpace = lightSpaceMatrix * vec4(fragPos, 1.0);
+                    // Perform perspective divide
+                    vec3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
+                    // Remap from [-1,1] to [0,1]
+                    projCoords = projCoords * 0.5 + 0.5;
+
+                    // Retrieve the depth of the closest surface from the shadow map
+                    float closestDepth = texture(shadowMap, projCoords.xy).r;
+                    float currentDepth = projCoords.z;
+                    
+                    // Compute bias to avoid shadow acne. Adjust these parameters as needed.
+                    float bias = max(0.005 * (1.0 - dot(normal, sunDir)), 0.001);
+                    
+                    // Hard comparison: if the current depth (minus bias) is greater than the stored depth, the fragment is in shadow.
+                    float shadow = currentDepth - bias > closestDepth ? 0.0 : 1.0;
+
+                    float sunIntensity = smoothstep(-0.1, 0.3, sunDir.y);
+
+                    // Combine the lighting components using the shadow factor
+                    vec3 lighting = ambient + (diffuse + specular) * shadow * sunIntensity;
+                
+                    // If a diffuse texture is used, modulate the lighting result
+                    if (useTexture)
+                    {
+                        vec4 texColor = texture(diffuseTexture, textureCoordinates);
+                        lighting *= texColor.rgb;
+                    }
+                    
+                    color = vec4(lighting, 1.0);
+                }
+
+            </main.frag>
+            <main.vert>
+                #version 430 core
+
+                layout(location = 0) in vec3 position;
+                layout(location = 1) in vec3 normal_in;
+                layout(location = 2) in vec2 textureCoordinates_in;
+
+                uniform mat4 modelMatrix;
+                uniform mat4 MVP;
+                uniform mat3 normalMatrix;
+
+                out vec3 normal_out;
+                out vec2 textureCoordinates;
+                out vec3 fragPos;
+
+                void main() {
+                    vec4 worldPos = modelMatrix * vec4(position, 1.0);
+                    fragPos = worldPos.xyz;
+                    normal_out = normalize(normalMatrix * normal_in);
+                    textureCoordinates = textureCoordinates_in;
+                    gl_Position = MVP * vec4(position, 1.0);
+                }
+
+            </main.vert>
+            <shadow.vert>
+                #version 430 core
+
+                layout (location = 0) in vec3 position;
+
+                uniform mat4 lightSpaceMatrix;
+                uniform mat4 modelMatrix;
+
+                void main()
+                {
+                    gl_Position = lightSpaceMatrix * modelMatrix * vec4(position, 1.0);
+                }
+
+            </shadow.vert>
+            <shadow.frag>
+                #version 430 core
+                // This fragment shader writes no color; depth is automatically output.
+                void main()
+                {
+                    // Empty - depth is written to the framebuffer automatically.
+                }
+
+            </shadow.frag>
+            <skybox.frag>
+                #version 430 core
+                out vec4 FragColor;
+                in vec3 TexCoords;
+
+                uniform samplerCube skybox;
+                uniform vec3 sunDir;
+
+
+                float rand(vec3 co)
+                {
+                    return fract(sin(dot(co, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+                }
+
+                void main()
+                {
+                    // --- Base Sky and Overall Dimming ---
+                    vec4 baseColor = texture(skybox, TexCoords);
+
+                    // t is the interpolation for sunsetting and rising, 1 at day and 0 at night
+                    float t = smoothstep(-0.1, 0.4, sunDir.y);
+                    // Darken the sky at night: full brightness at day and 40% brightness at night.
+                    float skyBrightness = mix(0.4, 1.0, t);
+                    vec4 modulatedBase = baseColor * skyBrightness;
+
+                    // --- Sun Disc Angular Blend ---
+                    // Calculate the cosine of the angle between this fragment direction and the sun direction.
+                    float d = dot(normalize(TexCoords), normalize(sunDir));
+                    // Define thresholds (in cosine-space):
+                    // Fragments with d >= cos(5°) are in the solid core.
+                    // Fragments with d <= cos(10°) show no sun.
+                    float solidThresh = cos(radians(5.0));
+                    float blurThresh  = cos(radians(10.0));
+                    // Use smoothstep to produce a smooth, narrow transition.
+                    float discBlend = smoothstep(blurThresh, solidThresh, d);
+                    // Add a touch of noise for a slight organic feel.
+                    float noise = rand(TexCoords * 10.0);
+                    float finalBlend = discBlend * (1.0 + 0.05 * (noise - 0.5));
+
+                    // --- Prevent Sun Disc from Blending at Night ---
+                    // Compute a factor to ensure that the sun disc does not appear when sun is low.
+                    // For example, if sunDir.y is below 0.0 (or near 0), we set discVisibility to 0.
+                    float discVisibility = smoothstep(-0.1, 0.1, sunDir.y);
+                    finalBlend *= discVisibility;
+
+                    // --- Dynamic Sun Color Transition ---
+                    // Define color stops for the sun disc.
+                    // • At day (t = 1): bright yellow.
+                    // • Around midday-to-dusk (t ~ 0.5): an orange hue.
+                    // • At night (t = 0): black.
+                    vec3 sunColorDay   = vec3(0.95, 0.76, 0.54); // Bright yellow
+                    vec3 sunColorMid   = vec3(0.95, 0.61, 0.16); // Orange-ish
+                    vec3 sunColor = mix(sunColorMid, sunColorDay, t);
+                    
+                    vec4 sunColorFinal = vec4(sunColor, 1.0);
+
+                    // --- Final Composition ---
+                    // Blend the darkened sky with the sun disc color using the computed blend factor.
+                    vec4 finalColor = mix(modulatedBase, sunColorFinal, finalBlend);
+
+                    FragColor = finalColor;
+                }
+
+            </skybox.frag>
+            <skybox.vert>
+                #version 430 core
+                layout (location = 0) in vec3 aPos;
+                out vec3 TexCoords;
+                uniform mat4 view;
+                uniform mat4 projection;
+
+                void main()
+                {
+                    TexCoords = aPos;
+                    vec4 pos = projection * view * vec4(aPos, 1.0);
+                    gl_Position = pos.xyww;
+                }
+
+            </skybox.vert>
+        </shaders>
+    <textures>
+        <sundial.jpeg/>
+    </textures>
+    <models>
+        <sundial.obj/>
+    </models>
+</res>

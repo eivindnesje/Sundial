@@ -21,9 +21,9 @@ SceneNode *sundialNode;
 
 // Camera parameters
 static glm::vec3 cameraPos;
-float cameraYaw = 0.0f;
-float cameraPitch = 25.0f;
-const float cameraRadius = 200.0f;
+float cameraYaw = 110.0f;
+float cameraPitch = 20.0f;
+const float cameraRadius = 230.0f;
 static bool revolvingMode = false;
 static float fixedRevolvePitch = cameraPitch; 
 
@@ -261,6 +261,7 @@ void updateFrame(GLFWwindow *window) {
 
     float angularSpeed = 2.0f * glm::pi<float>() / FULL_DAY;
     float angle = angularSpeed * elpasedTime;
+    angle = 2.9;
 
     // Sun moves on a circular path in the xy plane with a constant z offset
     float orbitRadius = 200.0f;
@@ -277,7 +278,7 @@ void updateFrame(GLFWwindow *window) {
     glm::vec3 center(0.0f);
 
     if(revolvingMode) {
-        cameraYaw += 10.0f * (float)timeDelta;  
+        // cameraYaw += 10.0f * (float)timeDelta;  
     }
     float effectivePitch = revolvingMode ? fixedRevolvePitch : cameraPitch;
 
